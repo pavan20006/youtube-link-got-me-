@@ -5,11 +5,14 @@ import signal
 import sqlite3
 import subprocess
 import sys
+from collections import OrderedDict
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from math import ceil
 from pathlib import Path
 from threading import Lock
+from time import monotonic
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
@@ -41,6 +44,13 @@ class ActiveDownload:
 
 active_downloads = {}
 active_downloads_lock = Lock()
+preview_cache = OrderedDict()
+preview_cache_lock = Lock()
+preview_cache_seconds = 600
+preview_cache_capacity = 32
+youtube_pause_lock = Lock()
+youtube_pause_until = 0.0
+youtube_pause_seconds = 60
 
 app.jinja_loader = DictLoader({"history.html": """
 {% if history %}
@@ -568,10 +578,102 @@ def youtube_restriction(output):
     return None
 
 
+def pause_youtube_requests():
+    global youtube_pause_until
+    with youtube_pause_lock:
+        youtube_pause_until = monotonic() + youtube_pause_seconds
+
+
+def youtube_pause_message():
+    with youtube_pause_lock:
+        remaining = ceil(youtube_pause_until - monotonic())
+    if remaining > 0:
+        return f"The app is pausing YouTube requests for {remaining} more seconds. YouTube may need longer."
+    return None
+
+
+class PreviewRequestError(Exception):
+    def __init__(self, message, http_status=200):
+        super().__init__(message)
+        self.http_status = http_status
+
+
+def lookup_preview(key, media_type, url):
+    cache_key = (key, media_type)
+    with preview_cache_lock:
+        # Serialize metadata lookups so simultaneous checks can share the same result.
+        cached = preview_cache.get(cache_key)
+        if cached and cached[0] > monotonic():
+            preview_cache.move_to_end(cache_key)
+            return cached[1]
+        pause = youtube_pause_message()
+        if pause:
+            raise PreviewRequestError(pause, 429)
+
+        options = ["-t", "mp4"] if media_type == "mp4" else ["-x", "--audio-format", "mp3"]
+        failure = "Could not check the size. Check the PowerShell window."
+        try:
+            result = subprocess.run(
+                [*yt_dlp_command, *options, "--skip-download", "--dump-single-json", "--", url],
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                encoding="utf-8", errors="replace", timeout=30,
+            )
+            video = json.loads(result.stdout)
+            preview = {"id": key, "title": video.get("title") or "YouTube video", "duration": video_duration(video)}
+        except subprocess.TimeoutExpired as error:
+            raise PreviewRequestError("The size check timed out. Try again.") from error
+        except subprocess.CalledProcessError as error:
+            output = error.stderr or ""
+            if output:
+                print(output, end="", file=sys.stderr, flush=True)
+            restriction = youtube_restriction(output)
+            if restriction:
+                http_status, message = restriction
+                if http_status == 429:
+                    pause_youtube_requests()
+                raise PreviewRequestError(message, http_status) from error
+            raise PreviewRequestError(failure) from error
+        except (OSError, ValueError) as error:
+            raise PreviewRequestError(failure) from error
+
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr, flush=True)
+        comparisons = []
+        message = ""
+        if media_type == "mp4":
+            available = {"best": video}
+            try:
+                available.update(compare_video_formats(result.stdout))
+            except (OSError, subprocess.SubprocessError, ValueError):
+                message = "Could not compare qualities. Best available is still ready to download."
+            else:
+                comparisons = [
+                    comparison_row(limit, available.get(limit), video.get("duration"))
+                    for limit in (*video_quality_limits, "best")
+                ]
+            sizes = {row["quality"]: row["message"] for row in comparisons if row["available"]}
+            if not sizes:
+                sizes = {"best": comparison_row("best", video, video.get("duration"))["message"]}
+        else:
+            amount, approximate = media_size(video, media_type)
+            sizes = {"best": size_message(amount, approximate, media_type)}
+
+        data = (preview, sizes, comparisons, message)
+        preview_cache[cache_key] = (monotonic() + preview_cache_seconds, data)
+        preview_cache.move_to_end(cache_key)
+        if len(preview_cache) > preview_cache_capacity:
+            preview_cache.popitem(last=False)
+        return data
+
+
 def download_events(command, url, download_id, cancel_url):
     def event(state, message, **details):
         return json.dumps({"state": state, "message": message, **details}) + "\n"
 
+    pause = youtube_pause_message()
+    if pause:
+        yield event("error", pause, http_status=429)
+        return
     finished_video = None
     restriction = None
     try:
@@ -654,6 +756,8 @@ def download_events(command, url, download_id, cancel_url):
                 yield event("complete", download_complete, history_saved=True)
         elif restriction:
             http_status, message = restriction
+            if http_status == 429:
+                pause_youtube_requests()
             yield event("error", message, http_status=http_status)
         else:
             yield event("error", download_failed)
@@ -711,60 +815,20 @@ def index():
                 if streaming:
                     return {"message": "Check the size for these settings before downloading."}, 400
                 try:
-                    preview_options = ["-t", "mp4"] if media_type == "mp4" else options
-                    result = subprocess.run(
-                        [*yt_dlp_command, *preview_options, "--skip-download", "--dump-single-json", "--", url],
-                        check=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=30,
-                    )
-                    video = json.loads(result.stdout)
-                    preview = {
-                        "id": key,
-                        "title": video.get("title") or "YouTube video",
-                        "duration": video_duration(video),
-                    }
-                except subprocess.TimeoutExpired:
-                    message = "The size check timed out. Try again."
-                except subprocess.CalledProcessError as error:
-                    output = error.stderr or ""
-                    if output:
-                        print(output, end="", file=sys.stderr, flush=True)
-                    restriction = youtube_restriction(output)
-                    if restriction:
-                        http_status, message = restriction
-                    else:
-                        message = "Could not check the size. Check the PowerShell window."
-                except (OSError, ValueError):
-                    message = "Could not check the size. Check the PowerShell window."
+                    preview, sizes, comparisons, message = lookup_preview(key, media_type, url)
+                except PreviewRequestError as error:
+                    http_status, message = error.http_status, str(error)
                 else:
-                    if result.stderr:
-                        print(result.stderr, end="", file=sys.stderr, flush=True)
                     if media_type == "mp4":
-                        available = {"best": video}
-                        try:
-                            available.update(compare_video_formats(result.stdout))
-                        except (OSError, subprocess.SubprocessError, ValueError):
-                            message = "Could not compare qualities. Best available is still ready to download."
-                        else:
-                            comparisons = [
-                                comparison_row(limit, available.get(limit), video.get("duration"))
-                                for limit in (*video_quality_limits, "best")
-                            ]
-                        if quality not in available:
+                        if quality not in sizes:
                             quality = "best"
                             if comparisons:
                                 message = "That quality is unavailable. Choose an available row below."
-                        selected = {**available[quality], "duration": video.get("duration")}
-                        checked = [f"{key}:{limit}:mp4" for limit in available]
+                        size = sizes[quality]
+                        checked = [f"{key}:{limit}:mp4" for limit in sizes]
                     else:
-                        selected = video
+                        size = sizes["best"]
                         checked = [selection]
-                    amount, approximate = media_size(selected, media_type)
-                    size = size_message(amount, approximate, media_type)
     if streaming:
         return {"message": message or "Check the size for these settings before downloading."}, 400
     return render_template_string(
