@@ -17,6 +17,8 @@ qualities = {
     "best": "Best available", "1080": "Up to 1080p", "720": "Up to 720p",
     "480": "Up to 480p", "360": "Up to 360p",
 }
+video_quality_limits = ("360", "480", "720", "1080")
+yt_dlp_command = ["yt-dlp", "--ignore-config", "--no-playlist"]
 progress_type = "application/x-ndjson"
 download_prefix = "DOWNLOADER_PROGRESS "
 processing_prefix = "DOWNLOADER_PROCESSING "
@@ -56,6 +58,10 @@ page = r"""
   .video-preview div { flex: 1 1 12rem; min-width: 0; overflow-wrap: anywhere; }
   .video-preview h2 { font-size: 1.125rem; margin: 0; }
   .video-preview p { margin: 0.375rem 0 0; }
+  .quality-comparison { margin: 0 0 1rem; min-width: 0; max-width: 37.5rem; }
+  .quality-comparison table { width: 100%; border-collapse: collapse; }
+  .quality-comparison th, .quality-comparison td { text-align: left; padding: 0.5rem 0.375rem; border-bottom: 1px solid #b8bdc6; }
+  .quality-comparison label { cursor: pointer; }
 </style>
 <h1>My Video Downloader</h1>
 <form id="download-form" method="post" action="{{ url_for('index') }}">
@@ -81,10 +87,37 @@ page = r"""
         <div>
           <h2 id="video-title">{{ preview.title }}</h2>
           <p>Duration: {{ preview.duration }}</p>
-          <p>{{ size }}</p>
+          <p id="preview-size" role="status">{{ size }}</p>
         </div>
       </article>
-      <input type="hidden" name="checked" value="{{ checked }}">
+      {% if comparisons %}
+        <fieldset class="quality-comparison">
+          <legend>Compare video qualities</legend>
+          <table>
+            <thead><tr><th scope="col">Quality</th><th scope="col">Resolution</th><th scope="col">File size</th></tr></thead>
+            <tbody>
+              {% for option in comparisons %}
+                <tr>
+                  <td>
+                    {% if option.available %}
+                      <label><input type="radio" name="compared_quality" value="{{ option.quality }}"
+                                    data-size="{{ option.message }}" {% if option.quality == quality %}checked{% endif %}>
+                        {{ qualities[option.quality] }}</label>
+                    {% else %}
+                      {{ qualities[option.quality] }}
+                    {% endif %}
+                  </td>
+                  <td>{{ option.resolution }}</td>
+                  <td>{{ option.size }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </fieldset>
+      {% endif %}
+      {% for selection in checked %}
+        <input type="hidden" name="checked" value="{{ selection }}">
+      {% endfor %}
       <button type="submit" name="action" value="download">Download</button>
     </div>
   {% endif %}
@@ -107,7 +140,12 @@ page = r"""
   let cancelUrl = null;
   let cancelling = false;
 
-  form.addEventListener('input', () => {
+  form.addEventListener('input', event => {
+    if (event.target.name === 'compared_quality') {
+      form.elements.quality.value = event.target.value;
+      document.querySelector('#preview-size').textContent = event.target.dataset.size;
+      return;
+    }
     if (checkedVideo) checkedVideo.hidden = true;
   });
 
@@ -237,17 +275,17 @@ def video_id(link):
     return ""
 
 
-def size_message(video, media_type):
+def media_size(video, media_type):
     duration = video.get("duration")
     if media_type == "mp3":
         if duration:
             # FFmpeg's default MP3 conversion here uses variable bitrate.
             size = duration * 130_000 / 8
-            return f"Estimated MP3 size: {size / 1024**2:.2f} MiB (actual size may vary)."
+            return f"{size / 1024**2:.2f} MiB", True
     else:
         tracks = video.get("requested_formats")
         if not tracks and video.get("ext") == "mp4" and video.get("filesize"):
-            return f"File size: {video['filesize'] / 1024**2:.2f} MiB"
+            return f"{video['filesize'] / 1024**2:.2f} MiB", False
         sizes = []
         for track in tracks or [video]:
             size = track.get("filesize") or track.get("filesize_approx")
@@ -257,8 +295,57 @@ def size_message(video, media_type):
                 break
             sizes.append(size)
         else:
-            return f"Estimated MP4 size: {sum(sizes) / 1024**2:.2f} MiB"
-    return "File size is unavailable before downloading."
+            return f"{sum(sizes) / 1024**2:.2f} MiB", True
+    return None, False
+
+
+def size_message(size, approximate, media_type):
+    if size is None:
+        return "File size is unavailable before downloading."
+    if approximate:
+        note = " (actual size may vary)." if media_type == "mp3" else ""
+        return f"Estimated {media_type.upper()} size: {size}{note}"
+    return f"File size: {size}"
+
+
+def video_format(quality):
+    return f"bv*[height<={quality}]+ba/b[height<={quality}]"
+
+
+def compare_video_formats(metadata):
+    # Each selector has a fallback so yt-dlp emits one result per requested limit.
+    # Validate the returned resolution before offering that row as a download.
+    selectors = ",".join(f"{video_format(quality)}/bv*+ba/b" for quality in video_quality_limits)
+    result = subprocess.run(
+        [
+            *yt_dlp_command, "-t", "mp4", "-f", selectors, "--skip-download",
+            "--print", "%(.{height,ext,filesize,filesize_approx,tbr,requested_formats})j",
+            "--load-info-json", "-",
+        ],
+        input=metadata, stdout=subprocess.PIPE, encoding="utf-8", check=True, timeout=10,
+    )
+    formats = [json.loads(line) for line in result.stdout.splitlines()]
+    if len(formats) != len(video_quality_limits):
+        raise ValueError("Unexpected number of format selections")
+    return {
+        quality: selected
+        for quality, selected in zip(video_quality_limits, formats)
+        if selected.get("height") and selected["height"] <= int(quality)
+    }
+
+
+def comparison_row(quality, selected, duration):
+    if selected is None:
+        return {"quality": quality, "available": False, "resolution": "—", "size": "Unavailable"}
+    size, approximate = media_size({**selected, "duration": duration}, "mp4")
+    height = selected.get("height")
+    return {
+        "quality": quality,
+        "available": True,
+        "resolution": f"{height}p" if height else "Unknown",
+        "size": (f"About {size}" if approximate else size) or "Unknown",
+        "message": size_message(size, approximate, "mp4"),
+    }
 
 
 def video_duration(video):
@@ -385,13 +472,17 @@ def download_events(command, url, download_id, cancel_url):
 def index():
     link = request.form.get("url", "").strip()
     quality = request.form.get("quality", "720")
+    media_type = "mp3" if request.form.get("format") == "mp3" else "mp4"
+    downloading = request.form.get("action") == "download"
+    if downloading and media_type == "mp4":
+        quality = request.form.get("compared_quality", quality)
     if quality not in qualities:
         quality = "720"
-    media_type = "mp3" if request.form.get("format") == "mp3" else "mp4"
     message = ""
-    checked = ""
+    checked = []
     size = ""
     preview = None
+    comparisons = []
     streaming = request.headers.get("Accept") == progress_type
     if request.method == "POST":
         key = video_id(link)
@@ -403,14 +494,12 @@ def index():
             if media_type == "mp3":
                 options = ["-x", "--audio-format", "mp3"]
             elif quality != "best":
-                options += [
-                    "-f", f"bv*[height<={quality}]+ba/b[height<={quality}]"
-                ]
+                options += ["-f", video_format(quality)]
 
-            command = ["yt-dlp", "--ignore-config", "--no-playlist", *options]
+            command = [*yt_dlp_command, *options]
             url = f"https://www.youtube.com/watch?v={key}"
             selection = f"{key}:{quality}:{media_type}"
-            if request.form.get("action") == "download" and request.form.get("checked") == selection:
+            if downloading and selection in request.form.getlist("checked"):
                 if streaming:
                     download_id = uuid4().hex
                     cancel_url = url_for("cancel_download", download_id=download_id)
@@ -428,28 +517,50 @@ def index():
                 if streaming:
                     return {"message": "Check the size for these settings before downloading."}, 400
                 try:
+                    preview_options = ["-t", "mp4"] if media_type == "mp4" else options
                     result = subprocess.run(
-                        [*command, "--skip-download", "--dump-single-json", "--", url],
+                        [*yt_dlp_command, *preview_options, "--skip-download", "--dump-single-json", "--", url],
                         check=True,
                         stdout=subprocess.PIPE,
                         encoding="utf-8",
                         timeout=30,
                     )
                     video = json.loads(result.stdout)
-                    size = size_message(video, media_type)
                     preview = {
                         "id": key,
                         "title": video.get("title") or "YouTube video",
                         "duration": video_duration(video),
                     }
-                    checked = selection
                 except subprocess.TimeoutExpired:
                     message = "The size check timed out. Try again."
                 except (OSError, subprocess.CalledProcessError, ValueError):
                     message = "Could not check the size. Check the PowerShell window."
+                else:
+                    if media_type == "mp4":
+                        available = {"best": video}
+                        try:
+                            available.update(compare_video_formats(result.stdout))
+                        except (OSError, subprocess.SubprocessError, ValueError):
+                            message = "Could not compare qualities. Best available is still ready to download."
+                        else:
+                            comparisons = [
+                                comparison_row(limit, available.get(limit), video.get("duration"))
+                                for limit in (*video_quality_limits, "best")
+                            ]
+                        if quality not in available:
+                            quality = "best"
+                            if comparisons:
+                                message = "That quality is unavailable. Choose an available row below."
+                        selected = {**available[quality], "duration": video.get("duration")}
+                        checked = [f"{key}:{limit}:mp4" for limit in available]
+                    else:
+                        selected = video
+                        checked = [selection]
+                    amount, approximate = media_size(selected, media_type)
+                    size = size_message(amount, approximate, media_type)
     if streaming:
         return {"message": message or "Check the size for these settings before downloading."}, 400
     return render_template_string(
         page, link=link, quality=quality, qualities=qualities, media_type=media_type,
-        message=message, checked=checked, size=size, preview=preview,
+        message=message, checked=checked, size=size, preview=preview, comparisons=comparisons,
     )
