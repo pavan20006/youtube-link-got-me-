@@ -559,11 +559,21 @@ def cancel_download(download_id):
         return "", 202 if job.cancelled else 409
 
 
+def youtube_restriction(output):
+    output = output.lower()
+    if "http error 429" in output or "429 too many requests" in output:
+        return 429, "YouTube is rate-limiting requests. Wait a while before trying again."
+    if "sign in to confirm" in output and "not a bot" in output:
+        return 403, "YouTube is asking for verification. Open the video on YouTube to check whether it plays."
+    return None
+
+
 def download_events(command, url, download_id, cancel_url):
     def event(state, message, **details):
         return json.dumps({"state": state, "message": message, **details}) + "\n"
 
     finished_video = None
+    restriction = None
     try:
         downloads.mkdir(exist_ok=True)
         with subprocess.Popen(
@@ -617,6 +627,9 @@ def download_events(command, url, download_id, cancel_url):
                         )
                     else:
                         print(line, end="", flush=True)
+                        blocked = youtube_restriction(line)
+                        if blocked and (restriction is None or blocked[0] == 429):
+                            restriction = blocked
                 returncode = process.wait()
             finally:
                 with active_downloads_lock:
@@ -639,6 +652,9 @@ def download_events(command, url, download_id, cancel_url):
                 yield event("complete", f"{download_complete} History could not be saved.")
             else:
                 yield event("complete", download_complete, history_saved=True)
+        elif restriction:
+            http_status, message = restriction
+            yield event("error", message, http_status=http_status)
         else:
             yield event("error", download_failed)
     except OSError as error:
@@ -661,6 +677,7 @@ def index():
     size = ""
     preview = None
     comparisons = []
+    http_status = 200
     streaming = request.headers.get("Accept") == progress_type
     if request.method == "POST":
         key = video_id(link)
@@ -687,7 +704,9 @@ def index():
                         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
                     )
                 for event in events:
-                    message = json.loads(event)["message"]
+                    update = json.loads(event)
+                    message = update["message"]
+                    http_status = update.get("http_status", 200)
             else:
                 if streaming:
                     return {"message": "Check the size for these settings before downloading."}, 400
@@ -697,7 +716,9 @@ def index():
                         [*yt_dlp_command, *preview_options, "--skip-download", "--dump-single-json", "--", url],
                         check=True,
                         stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
                         encoding="utf-8",
+                        errors="replace",
                         timeout=30,
                     )
                     video = json.loads(result.stdout)
@@ -708,9 +729,20 @@ def index():
                     }
                 except subprocess.TimeoutExpired:
                     message = "The size check timed out. Try again."
-                except (OSError, subprocess.CalledProcessError, ValueError):
+                except subprocess.CalledProcessError as error:
+                    output = error.stderr or ""
+                    if output:
+                        print(output, end="", file=sys.stderr, flush=True)
+                    restriction = youtube_restriction(output)
+                    if restriction:
+                        http_status, message = restriction
+                    else:
+                        message = "Could not check the size. Check the PowerShell window."
+                except (OSError, ValueError):
                     message = "Could not check the size. Check the PowerShell window."
                 else:
+                    if result.stderr:
+                        print(result.stderr, end="", file=sys.stderr, flush=True)
                     if media_type == "mp4":
                         available = {"best": video}
                         try:
@@ -739,4 +771,4 @@ def index():
         page, link=link, quality=quality, qualities=qualities, media_type=media_type,
         message=message, checked=checked, size=size, preview=preview,
         comparisons=comparisons, history=recent_history(),
-    )
+    ), http_status
