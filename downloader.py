@@ -1,10 +1,15 @@
 import json
+import os
 import re
+import signal
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from urllib.parse import parse_qs, urlsplit
+from uuid import uuid4
 
-from flask import Flask, Response, render_template_string, request
+from flask import Flask, Response, render_template_string, request, url_for
 
 app = Flask(__name__)
 downloads = Path.home() / "Downloads"
@@ -17,6 +22,16 @@ download_prefix = "DOWNLOADER_PROGRESS "
 processing_prefix = "DOWNLOADER_PROCESSING "
 download_complete = "Download complete. Open your Downloads folder."
 download_failed = "Download failed. Check the PowerShell window."
+
+
+@dataclass
+class ActiveDownload:
+    process: subprocess.Popen
+    cancelled: bool = False
+
+
+active_downloads = {}
+active_downloads_lock = Lock()
 
 page = r"""
 <!doctype html>
@@ -52,6 +67,7 @@ page = r"""
 <div id="download-progress" hidden>
   <progress id="progress-bar" aria-label="Current download progress" max="100"></progress>
   <p id="progress-details"></p>
+  <button id="cancel-download" type="button" hidden>Cancel download</button>
 </div>
 <p id="download-status" role="status">{{ message }}</p>
 <script>
@@ -60,7 +76,31 @@ page = r"""
   const bar = document.querySelector('#progress-bar');
   const details = document.querySelector('#progress-details');
   const status = document.querySelector('#download-status');
+  const cancel = document.querySelector('#cancel-download');
   const size = bytes => `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+  let cancelUrl = null;
+  let cancelling = false;
+
+  cancel.addEventListener('click', async () => {
+    if (!cancelUrl || cancelling) return;
+    const url = cancelUrl;
+    cancelling = true;
+    cancel.disabled = true;
+    status.textContent = 'Cancelling download…';
+    try {
+      const response = await fetch(url, {method: 'POST'});
+      // The download may have finished before the cancellation request arrived.
+      if (!response.ok && response.status !== 404 && response.status !== 409) {
+        throw new Error('Cancellation failed');
+      }
+    } catch {
+      if (cancelUrl === url) {
+        cancelling = false;
+        cancel.disabled = false;
+        status.textContent = 'Could not cancel. Try again.';
+      }
+    }
+  });
 
   function showProgress(event) {
     if (status.textContent !== event.message) status.textContent = event.message;
@@ -69,7 +109,7 @@ page = r"""
       details.textContent = '100%';
       return;
     }
-    if (event.state === 'error') progress.hidden = true;
+    if (event.state === 'error' || event.state === 'cancelled') progress.hidden = true;
 
     const {downloaded, total, estimated, eta} = event;
     const parts = [];
@@ -125,8 +165,14 @@ page = r"""
         pending = lines.pop();
         for (const line of lines) {
           const update = JSON.parse(line);
-          showProgress(update);
-          finished = update.state === 'complete' || update.state === 'error';
+          if (update.cancel_url) {
+            cancelUrl = update.cancel_url;
+            cancel.hidden = false;
+            cancel.disabled = false;
+          }
+          finished = ['complete', 'error', 'cancelled'].includes(update.state);
+          if (finished) cancel.hidden = true;
+          if (!cancelling || finished) showProgress(update);
         }
       }
       if (!finished) throw new Error('Download connection closed');
@@ -134,6 +180,9 @@ page = r"""
       controller.abort();
       showProgress({state: 'error', message: 'Download interrupted. Check the PowerShell window.'});
     } finally {
+      cancelUrl = null;
+      cancelling = false;
+      cancel.hidden = true;
       controls.forEach(control => { control.disabled = false; });
     }
   });
@@ -182,11 +231,46 @@ def size_message(video, media_type):
     return "File size is unavailable before downloading."
 
 
-def download_events(command, url):
+def stop_process_tree(process):
+    if process.poll() is not None:
+        return False
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, check=True, timeout=5,
+            )
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return False
+    except subprocess.CalledProcessError:
+        if process.poll() is not None:
+            return False
+        raise
+    return True
+
+
+@app.post("/downloads/<download_id>/cancel")
+def cancel_download(download_id):
+    with active_downloads_lock:
+        job = active_downloads.get(download_id)
+        if job is None:
+            return "", 404
+        if job.cancelled:
+            return "", 202
+        try:
+            job.cancelled = stop_process_tree(job.process)
+        except (OSError, subprocess.SubprocessError) as error:
+            print(f"Could not cancel the download: {error}", flush=True)
+            return "", 500
+        return "", 202 if job.cancelled else 409
+
+
+def download_events(command, url, download_id, cancel_url):
     def event(state, message, **details):
         return json.dumps({"state": state, "message": message, **details}) + "\n"
 
-    yield event("starting", "Starting download…")
     try:
         downloads.mkdir(exist_ok=True)
         with subprocess.Popen(
@@ -200,8 +284,13 @@ def download_events(command, url):
             ],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             encoding="utf-8", errors="replace",
+            start_new_session=os.name != "nt",
         ) as process:
+            job = ActiveDownload(process)
+            with active_downloads_lock:
+                active_downloads[download_id] = job
             try:
+                yield event("starting", "Starting download…", cancel_url=cancel_url)
                 for line in process.stdout:
                     if line.startswith(processing_prefix):
                         step = line.removeprefix(processing_prefix).strip()
@@ -230,9 +319,17 @@ def download_events(command, url):
                         print(line, end="", flush=True)
                 returncode = process.wait()
             finally:
-                if process.poll() is None:
-                    process.kill()
-        if returncode == 0:
+                with active_downloads_lock:
+                    active_downloads.pop(download_id)
+                if not job.cancelled:
+                    try:
+                        stop_process_tree(process)
+                    except (OSError, subprocess.SubprocessError):
+                        if process.poll() is None:
+                            process.kill()
+        if job.cancelled:
+            yield event("cancelled", "Download cancelled.")
+        elif returncode == 0:
             yield event("complete", download_complete)
         else:
             yield event("error", download_failed)
@@ -271,8 +368,10 @@ def index():
             selection = f"{key}:{quality}:{media_type}"
             if request.form.get("action") == "download" and request.form.get("checked") == selection:
                 if streaming:
+                    download_id = uuid4().hex
+                    cancel_url = url_for("cancel_download", download_id=download_id)
                     return Response(
-                        download_events(command, url), mimetype=progress_type,
+                        download_events(command, url, download_id, cancel_url), mimetype=progress_type,
                         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
                     )
                 try:
