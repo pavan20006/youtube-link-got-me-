@@ -28,7 +28,7 @@ page = r"""
   progress { width: min(100%, 24rem); height: 1.25rem; }
 </style>
 <h1>My Video Downloader</h1>
-<form id="download-form" method="post">
+<form id="download-form" method="post" action="{{ url_for('index') }}">
   <label for="url">YouTube video link</label>
   <input id="url" name="url" type="url" value="{{ link }}" required>
   <label for="quality">Video quality</label>
@@ -102,7 +102,7 @@ page = r"""
 
     const controller = new AbortController();
     try {
-      const response = await fetch(form.action, {
+      const response = await fetch(form.getAttribute('action'), {
         method: 'POST', body: data, headers: {Accept: 'application/x-ndjson'}, signal: controller.signal,
       });
       if (response.status === 400) {
