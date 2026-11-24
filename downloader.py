@@ -41,6 +41,21 @@ page = r"""
 <title>My Video Downloader</title>
 <style>
   progress { width: min(100%, 24rem); height: 1.25rem; }
+  .video-preview {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem;
+    align-items: center;
+    max-width: 36rem;
+    margin: 1rem 0;
+    padding: 0.75rem;
+    border: 1px solid #b8bdc6;
+    border-radius: 0.5rem;
+  }
+  .video-preview img { max-width: 100%; height: auto; border-radius: 0.25rem; }
+  .video-preview div { flex: 1 1 12rem; min-width: 0; overflow-wrap: anywhere; }
+  .video-preview h2 { font-size: 1.125rem; margin: 0; }
+  .video-preview p { margin: 0.375rem 0 0; }
 </style>
 <h1>My Video Downloader</h1>
 <form id="download-form" method="post" action="{{ url_for('index') }}">
@@ -59,9 +74,19 @@ page = r"""
   </select>
   <button type="submit" name="action" value="check">Check size</button>
   {% if checked %}
-    <p role="status">{{ size }}</p>
-    <input type="hidden" name="checked" value="{{ checked }}">
-    <button type="submit" name="action" value="download">Download</button>
+    <div id="checked-video">
+      <article class="video-preview" aria-labelledby="video-title">
+        <img src="https://i.ytimg.com/vi/{{ preview.id }}/hqdefault.jpg" alt=""
+             width="192" height="144" referrerpolicy="no-referrer">
+        <div>
+          <h2 id="video-title">{{ preview.title }}</h2>
+          <p>Duration: {{ preview.duration }}</p>
+          <p>{{ size }}</p>
+        </div>
+      </article>
+      <input type="hidden" name="checked" value="{{ checked }}">
+      <button type="submit" name="action" value="download">Download</button>
+    </div>
   {% endif %}
 </form>
 <div id="download-progress" hidden>
@@ -77,9 +102,14 @@ page = r"""
   const details = document.querySelector('#progress-details');
   const status = document.querySelector('#download-status');
   const cancel = document.querySelector('#cancel-download');
+  const checkedVideo = document.querySelector('#checked-video');
   const size = bytes => `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
   let cancelUrl = null;
   let cancelling = false;
+
+  form.addEventListener('input', () => {
+    if (checkedVideo) checkedVideo.hidden = true;
+  });
 
   cancel.addEventListener('click', async () => {
     if (!cancelUrl || cancelling) return;
@@ -231,6 +261,19 @@ def size_message(video, media_type):
     return "File size is unavailable before downloading."
 
 
+def video_duration(video):
+    if video.get("is_live"):
+        return "Live"
+    duration = video.get("duration")
+    if duration is None:
+        return "Unavailable"
+    minutes, seconds = divmod(int(duration), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
 def stop_process_tree(process):
     if process.poll() is not None:
         return False
@@ -348,6 +391,7 @@ def index():
     message = ""
     checked = ""
     size = ""
+    preview = None
     streaming = request.headers.get("Accept") == progress_type
     if request.method == "POST":
         key = video_id(link)
@@ -391,7 +435,13 @@ def index():
                         encoding="utf-8",
                         timeout=30,
                     )
-                    size = size_message(json.loads(result.stdout), media_type)
+                    video = json.loads(result.stdout)
+                    size = size_message(video, media_type)
+                    preview = {
+                        "id": key,
+                        "title": video.get("title") or "YouTube video",
+                        "duration": video_duration(video),
+                    }
                     checked = selection
                 except subprocess.TimeoutExpired:
                     message = "The size check timed out. Try again."
@@ -401,5 +451,5 @@ def index():
         return {"message": message or "Check the size for these settings before downloading."}, 400
     return render_template_string(
         page, link=link, quality=quality, qualities=qualities, media_type=media_type,
-        message=message, checked=checked, size=size,
+        message=message, checked=checked, size=size, preview=preview,
     )
