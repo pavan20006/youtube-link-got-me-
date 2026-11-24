@@ -2,17 +2,23 @@ import json
 import os
 import re
 import signal
+import sqlite3
 import subprocess
+import sys
+from contextlib import closing
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
-from flask import Flask, Response, render_template_string, request, url_for
+from flask import Flask, Response, render_template, render_template_string, request, url_for
+from jinja2 import DictLoader
 
 app = Flask(__name__)
 downloads = Path.home() / "Downloads"
+history_database = Path.home() / ".video-downloader" / "history.sqlite3"
 qualities = {
     "best": "Best available", "1080": "Up to 1080p", "720": "Up to 720p",
     "480": "Up to 480p", "360": "Up to 360p",
@@ -22,6 +28,7 @@ yt_dlp_command = ["yt-dlp", "--ignore-config", "--no-playlist"]
 progress_type = "application/x-ndjson"
 download_prefix = "DOWNLOADER_PROGRESS "
 processing_prefix = "DOWNLOADER_PROCESSING "
+finished_file_prefix = "DOWNLOADER_FILE "
 download_complete = "Download complete. Open your Downloads folder."
 download_failed = "Download failed. Check the PowerShell window."
 
@@ -34,6 +41,25 @@ class ActiveDownload:
 
 active_downloads = {}
 active_downloads_lock = Lock()
+
+app.jinja_loader = DictLoader({"history.html": """
+{% if history %}
+  <ul class="history-list">
+    {% for item in history %}
+      <li>
+        <strong>{{ item.title }}</strong>
+        <p>{{ item.format }}{% if item.height %} · {{ item.height }}p{% endif %} · {{ item.size }} · {{ item.date }}</p>
+        <form action="{{ url_for('open_history_item', item_id=item.id) }}" method="post">
+          <button type="submit" name="target" value="file">Open file</button>
+          <button type="submit" name="target" value="folder">Open folder</button>
+        </form>
+      </li>
+    {% endfor %}
+  </ul>
+{% else %}
+  <p>No completed downloads yet.</p>
+{% endif %}
+"""})
 
 page = r"""
 <!doctype html>
@@ -62,6 +88,10 @@ page = r"""
   .quality-comparison table { width: 100%; border-collapse: collapse; }
   .quality-comparison th, .quality-comparison td { text-align: left; padding: 0.5rem 0.375rem; border-bottom: 1px solid #b8bdc6; }
   .quality-comparison label { cursor: pointer; }
+  .download-history { margin-top: 1.5rem; max-width: 38rem; }
+  .history-list { list-style: none; padding: 0; }
+  .history-list li { padding: 0.75rem 0; border-bottom: 1px solid #b8bdc6; overflow-wrap: anywhere; }
+  .history-list p { margin: 0.35rem 0; }
 </style>
 <h1>My Video Downloader</h1>
 <form id="download-form" method="post" action="{{ url_for('index') }}">
@@ -128,6 +158,13 @@ page = r"""
   <button id="cancel-download" type="button" hidden>Cancel download</button>
 </div>
 <p id="download-status" role="status">{{ message }}</p>
+<section class="download-history" aria-labelledby="history-title">
+  <h2 id="history-title">Download history</h2>
+  <div id="history-entries" data-url="{{ url_for('download_history') }}">
+    {% include 'history.html' %}
+  </div>
+  <p id="history-status" role="status"></p>
+</section>
 <script>
   const form = document.querySelector('#download-form');
   const progress = document.querySelector('#download-progress');
@@ -136,9 +173,35 @@ page = r"""
   const status = document.querySelector('#download-status');
   const cancel = document.querySelector('#cancel-download');
   const checkedVideo = document.querySelector('#checked-video');
+  const historyEntries = document.querySelector('#history-entries');
+  const historyStatus = document.querySelector('#history-status');
   const size = bytes => `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
   let cancelUrl = null;
   let cancelling = false;
+
+  async function refreshHistory() {
+    try {
+      const response = await fetch(historyEntries.dataset.url, {cache: 'no-store'});
+      if (!response.ok) throw new Error('History refresh failed');
+      historyEntries.innerHTML = await response.text();
+    } catch {
+      historyStatus.textContent = 'Refresh the page to see your latest downloads.';
+    }
+  }
+
+  historyEntries.addEventListener('submit', async event => {
+    if (!event.submitter) return;
+    event.preventDefault();
+    const data = new FormData();
+    data.set('target', event.submitter.value);
+    try {
+      const response = await fetch(event.target.getAttribute('action'), {method: 'POST', body: data});
+      const {message} = await response.json();
+      historyStatus.textContent = message;
+    } catch {
+      historyStatus.textContent = 'Could not open this download.';
+    }
+  });
 
   form.addEventListener('input', event => {
     if (event.target.name === 'compared_quality') {
@@ -241,6 +304,7 @@ page = r"""
           finished = ['complete', 'error', 'cancelled'].includes(update.state);
           if (finished) cancel.hidden = true;
           if (!cancelling || finished) showProgress(update);
+          if (update.history_saved) refreshHistory();
         }
       }
       if (!finished) throw new Error('Download connection closed');
@@ -275,17 +339,115 @@ def video_id(link):
     return ""
 
 
+def format_mib(size):
+    return f"{size / 1024**2:.2f} MiB"
+
+
+def local_download_path(value):
+    path = Path(value).resolve()
+    if not path.is_relative_to(downloads.resolve()) or path.suffix.lower() not in {".mp4", ".mp3"}:
+        raise ValueError("File is outside the supported downloads")
+    return path
+
+
+def record_download(video):
+    path = local_download_path(video.get("filepath") or "")
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    size = path.stat().st_size
+    media_type = path.suffix[1:].upper()
+    height = video.get("height") if media_type == "MP4" else None
+    downloaded_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    history_database.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(history_database)) as connection, connection:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS downloads (
+                id INTEGER PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                format TEXT NOT NULL,
+                height INTEGER,
+                size INTEGER NOT NULL,
+                downloaded_at TEXT NOT NULL
+            )
+        """)
+        connection.execute("""
+            INSERT INTO downloads (path, title, format, height, size, downloaded_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET title=excluded.title, format=excluded.format,
+                height=excluded.height, size=excluded.size, downloaded_at=excluded.downloaded_at
+        """, (str(path), video.get("title") or path.stem, media_type, height, size, downloaded_at))
+
+
+def history_rows(item_id=None):
+    if not history_database.is_file():
+        return []
+    with closing(sqlite3.connect(history_database)) as connection:
+        connection.row_factory = sqlite3.Row
+        if item_id is not None:
+            return connection.execute("SELECT path FROM downloads WHERE id = ?", (item_id,)).fetchall()
+        return connection.execute("""
+            SELECT id, title, format, height, size, downloaded_at FROM downloads
+            ORDER BY downloaded_at DESC, id DESC LIMIT 50
+        """).fetchall()
+
+
+def recent_history():
+    try:
+        return [
+            {
+                **dict(item), "size": format_mib(item["size"]),
+                "date": datetime.fromisoformat(item["downloaded_at"]).astimezone().strftime("%d %b %Y, %H:%M"),
+            }
+            for item in history_rows()
+        ]
+    except (OSError, sqlite3.Error, ValueError) as error:
+        print(f"Could not read download history: {error}", flush=True)
+        return []
+
+
+@app.get("/history")
+def download_history():
+    return render_template("history.html", history=recent_history())
+
+
+@app.post("/history/<int:item_id>/open")
+def open_history_item(item_id):
+    target = request.form.get("target")
+    if target not in {"file", "folder"} or request.headers.get("Sec-Fetch-Site") == "cross-site":
+        return {"message": "Invalid request."}, 400
+    try:
+        rows = history_rows(item_id)
+        if not rows:
+            return {"message": "This download could not be found in history."}, 404
+        path = local_download_path(rows[0]["path"])
+        if target == "folder":
+            path = path.parent
+        exists = path.is_dir() if target == "folder" else path.is_file()
+        if not exists:
+            return {"message": f"The {target} is no longer in Downloads."}, 404
+        if os.name == "nt":
+            os.startfile(path)
+        else:
+            launcher = "open" if sys.platform == "darwin" else "xdg-open"
+            subprocess.Popen([launcher, str(path)])
+    except (OSError, sqlite3.Error, ValueError) as error:
+        print(f"Could not open download history item: {error}", flush=True)
+        return {"message": f"Could not open the {target}."}, 500
+    return {"message": f"Opening the {target}."}
+
+
 def media_size(video, media_type):
     duration = video.get("duration")
     if media_type == "mp3":
         if duration:
             # FFmpeg's default MP3 conversion here uses variable bitrate.
             size = duration * 130_000 / 8
-            return f"{size / 1024**2:.2f} MiB", True
+            return format_mib(size), True
     else:
         tracks = video.get("requested_formats")
         if not tracks and video.get("ext") == "mp4" and video.get("filesize"):
-            return f"{video['filesize'] / 1024**2:.2f} MiB", False
+            return format_mib(video["filesize"]), False
         sizes = []
         for track in tracks or [video]:
             size = track.get("filesize") or track.get("filesize_approx")
@@ -295,7 +457,7 @@ def media_size(video, media_type):
                 break
             sizes.append(size)
         else:
-            return f"{sum(sizes) / 1024**2:.2f} MiB", True
+            return format_mib(sum(sizes)), True
     return None, False
 
 
@@ -401,6 +563,7 @@ def download_events(command, url, download_id, cancel_url):
     def event(state, message, **details):
         return json.dumps({"state": state, "message": message, **details}) + "\n"
 
+    finished_video = None
     try:
         downloads.mkdir(exist_ok=True)
         with subprocess.Popen(
@@ -410,6 +573,8 @@ def download_events(command, url, download_id, cancel_url):
                 f"download:{download_prefix}%(info.vcodec)j\t"
                 "%(progress.{status,downloaded_bytes,total_bytes,total_bytes_estimate,eta})j",
                 "--progress-template", f"postprocess:{processing_prefix}%(progress.postprocessor)s",
+                "--print", f"after_move:{finished_file_prefix}" "%(.{filepath,title,height})j",
+                "--no-simulate", "--no-quiet", "--encoding", "utf-8",
                 "-P", str(downloads), "--", url,
             ],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -422,7 +587,12 @@ def download_events(command, url, download_id, cancel_url):
             try:
                 yield event("starting", "Starting download…", cancel_url=cancel_url)
                 for line in process.stdout:
-                    if line.startswith(processing_prefix):
+                    if line.startswith(finished_file_prefix):
+                        try:
+                            finished_video = json.loads(line.removeprefix(finished_file_prefix))
+                        except ValueError:
+                            continue
+                    elif line.startswith(processing_prefix):
                         step = line.removeprefix(processing_prefix).strip()
                         message = {
                             "Merger": "Merging video and audio…",
@@ -460,7 +630,15 @@ def download_events(command, url, download_id, cancel_url):
         if job.cancelled:
             yield event("cancelled", "Download cancelled.")
         elif returncode == 0:
-            yield event("complete", download_complete)
+            try:
+                if not isinstance(finished_video, dict):
+                    raise ValueError("yt-dlp did not report the final file")
+                record_download(finished_video)
+            except (OSError, sqlite3.Error, ValueError) as error:
+                print(f"Could not save download history: {error}", flush=True)
+                yield event("complete", f"{download_complete} History could not be saved.")
+            else:
+                yield event("complete", download_complete, history_saved=True)
         else:
             yield event("error", download_failed)
     except OSError as error:
@@ -500,19 +678,16 @@ def index():
             url = f"https://www.youtube.com/watch?v={key}"
             selection = f"{key}:{quality}:{media_type}"
             if downloading and selection in request.form.getlist("checked"):
+                download_id = uuid4().hex
+                cancel_url = url_for("cancel_download", download_id=download_id)
+                events = download_events(command, url, download_id, cancel_url)
                 if streaming:
-                    download_id = uuid4().hex
-                    cancel_url = url_for("cancel_download", download_id=download_id)
                     return Response(
-                        download_events(command, url, download_id, cancel_url), mimetype=progress_type,
+                        events, mimetype=progress_type,
                         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
                     )
-                try:
-                    downloads.mkdir(exist_ok=True)
-                    subprocess.run([*command, "-P", str(downloads), "--", url], check=True)
-                    message = download_complete
-                except (OSError, subprocess.CalledProcessError):
-                    message = download_failed
+                for event in events:
+                    message = json.loads(event)["message"]
             else:
                 if streaming:
                     return {"message": "Check the size for these settings before downloading."}, 400
@@ -562,5 +737,6 @@ def index():
         return {"message": message or "Check the size for these settings before downloading."}, 400
     return render_template_string(
         page, link=link, quality=quality, qualities=qualities, media_type=media_type,
-        message=message, checked=checked, size=size, preview=preview, comparisons=comparisons,
+        message=message, checked=checked, size=size, preview=preview,
+        comparisons=comparisons, history=recent_history(),
     )
