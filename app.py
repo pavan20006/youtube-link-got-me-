@@ -103,10 +103,7 @@ def download():
                 stderr=subprocess.PIPE,
                 encoding="utf-8",
                 errors="replace",
-                timeout=90,
             )
-        except subprocess.TimeoutExpired:
-            return page(link, "The download timed out. Try a shorter video."), 504
         except subprocess.CalledProcessError as error:
             output_text = (error.stderr or "").lower()
             if "http error 429" in output_text:
