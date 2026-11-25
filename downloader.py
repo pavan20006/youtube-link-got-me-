@@ -167,6 +167,24 @@ page = r"""
     </div>
   {% endif %}
 </form>
+{% if existing %}
+  <section id="existing-video" aria-labelledby="existing-title">
+    <article class="video-preview">
+      <div>
+        <h2 id="existing-title">Already downloaded</h2>
+        <p>{{ existing.title }}</p>
+        <p>{{ existing.format }}{% if existing.height %} · {{ existing.height }}p{% endif %} · {{ existing.size }}</p>
+        <form action="{{ url_for('open_history_item', item_id=existing.id) }}" method="post">
+          <button type="submit" name="target" value="file">Open existing file</button>
+        </form>
+        {% if not checked %}
+          <button type="submit" form="download-form" name="action" value="check-online">Check online sizes</button>
+        {% endif %}
+        <p id="existing-status" role="status"></p>
+      </div>
+    </article>
+  </section>
+{% endif %}
 <div id="download-progress" hidden>
   <progress id="progress-bar" aria-label="Current download progress" max="100"></progress>
   <p id="progress-details"></p>
@@ -203,6 +221,7 @@ page = r"""
   const status = document.querySelector('#download-status');
   const cancel = document.querySelector('#cancel-download');
   const checkedVideo = document.querySelector('#checked-video');
+  const existingVideo = document.querySelector('#existing-video');
   const historyForm = document.querySelector('#history-filters');
   const historyEntries = document.querySelector('#history-entries');
   const historyStatus = document.querySelector('#history-status');
@@ -239,7 +258,7 @@ page = r"""
     refreshHistory();
   });
 
-  historyEntries.addEventListener('submit', async event => {
+  async function openSavedDownload(event, feedback) {
     if (!event.submitter) return;
     event.preventDefault();
     const data = new FormData();
@@ -247,10 +266,15 @@ page = r"""
     try {
       const response = await fetch(event.target.getAttribute('action'), {method: 'POST', body: data});
       const {message} = await response.json();
-      historyStatus.textContent = message;
+      feedback.textContent = message;
     } catch {
-      historyStatus.textContent = 'Could not open this download.';
+      feedback.textContent = 'Could not open this download.';
     }
+  }
+
+  historyEntries.addEventListener('submit', event => openSavedDownload(event, historyStatus));
+  existingVideo?.addEventListener('submit', event => {
+    openSavedDownload(event, document.querySelector('#existing-status'));
   });
 
   form.addEventListener('input', event => {
@@ -260,6 +284,7 @@ page = r"""
       return;
     }
     if (checkedVideo) checkedVideo.hidden = true;
+    if (existingVideo && ['url', 'format'].includes(event.target.name)) existingVideo.hidden = true;
   });
 
   cancel.addEventListener('click', async () => {
@@ -434,7 +459,7 @@ def record_download(video):
         """, (str(path), video.get("title") or path.stem, media_type, height, size, downloaded_at))
 
 
-def history_rows(item_id=None, *, query="", media_format=""):
+def history_rows(item_id=None, *, query="", media_format="", filename_suffix=""):
     if not history_database.is_file():
         return []
     with closing(sqlite3.connect(history_database)) as connection:
@@ -444,11 +469,30 @@ def history_rows(item_id=None, *, query="", media_format=""):
         connection.create_function("casefold", 1, str.casefold)
         query = query.casefold()
         return connection.execute("""
-            SELECT id, title, format, height, size, downloaded_at FROM downloads
+            SELECT id, path, title, format, height, size, downloaded_at FROM downloads
             WHERE (? = '' OR instr(casefold(title), ?) > 0)
               AND (? = '' OR format = ?)
+              AND (? = '' OR substr(path, -length(?)) = ?)
             ORDER BY downloaded_at DESC, id DESC LIMIT 50
-        """, (query, query, media_format, media_format)).fetchall()
+        """, (query, query, media_format, media_format, filename_suffix, filename_suffix, filename_suffix)).fetchall()
+
+
+def find_existing_download(key, media_type):
+    # yt-dlp's default completed filename ends with the video ID before the extension.
+    suffix = f" [{key}].{media_type}"
+    try:
+        rows = history_rows(media_format=media_type.upper(), filename_suffix=suffix)
+    except (OSError, sqlite3.Error) as error:
+        print(f"Could not look up existing downloads: {error}", flush=True)
+        return None
+    for item in rows:
+        try:
+            path = local_download_path(item["path"])
+            if path.is_file():
+                return {**dict(item), "size": format_mib(path.stat().st_size)}
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return None
 
 
 def recent_history(query, media_format):
@@ -832,7 +876,8 @@ def index():
     link = request.form.get("url", "").strip()
     quality = request.form.get("quality", "720")
     media_type = "mp3" if request.form.get("format") == "mp3" else "mp4"
-    downloading = request.form.get("action") == "download"
+    action = request.form.get("action")
+    downloading = action == "download"
     if downloading and media_type == "mp4":
         quality = request.form.get("compared_quality", quality)
     if quality not in qualities:
@@ -841,6 +886,7 @@ def index():
     checked = []
     size = ""
     preview = None
+    existing = None
     comparisons = []
     http_status = 200
     streaming = request.headers.get("Accept") == progress_type
@@ -875,25 +921,27 @@ def index():
             else:
                 if streaming:
                     return {"message": "Check the size for these settings before downloading."}, 400
-                try:
-                    preview, sizes, comparisons, message = lookup_preview(key, media_type, url)
-                except PreviewRequestError as error:
-                    http_status, message = error.http_status, str(error)
-                else:
-                    if media_type == "mp4":
-                        if quality not in sizes:
-                            quality = "best"
-                            if comparisons:
-                                message = "That quality is unavailable. Choose an available row below."
-                        size = sizes[quality]
-                        checked = [f"{key}:{limit}:mp4" for limit in sizes]
+                existing = find_existing_download(key, media_type)
+                if not existing or action == "check-online":
+                    try:
+                        preview, sizes, comparisons, message = lookup_preview(key, media_type, url)
+                    except PreviewRequestError as error:
+                        http_status, message = error.http_status, str(error)
                     else:
-                        size = sizes["best"]
-                        checked = [selection]
+                        if media_type == "mp4":
+                            if quality not in sizes:
+                                quality = "best"
+                                if comparisons:
+                                    message = "That quality is unavailable. Choose an available row below."
+                            size = sizes[quality]
+                            checked = [f"{key}:{limit}:mp4" for limit in sizes]
+                        else:
+                            size = sizes["best"]
+                            checked = [selection]
     if streaming:
         return {"message": message or "Check the size for these settings before downloading."}, 400
     return render_template_string(
         page, link=link, quality=quality, qualities=qualities, media_type=media_type,
-        message=message, checked=checked, size=size, preview=preview,
+        message=message, checked=checked, size=size, preview=preview, existing=existing,
         comparisons=comparisons, **history_context(),
     ), http_status
