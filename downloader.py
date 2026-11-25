@@ -43,6 +43,7 @@ class ActiveDownload:
 
 
 active_downloads = {}
+active_video_ids = set()
 active_downloads_lock = Lock()
 preview_cache = OrderedDict()
 preview_cache_lock = Lock()
@@ -101,6 +102,9 @@ page = r"""
   .quality-comparison th, .quality-comparison td { text-align: left; padding: 0.5rem 0.375rem; border-bottom: 1px solid #b8bdc6; }
   .quality-comparison label { cursor: pointer; }
   .download-history { margin-top: 1.5rem; max-width: 38rem; }
+  .download-job { max-width: 36rem; padding: 0.75rem; margin: 0.75rem 0; border: 1px solid #b8bdc6; border-radius: 0.5rem; }
+  .download-job h3 { margin: 0 0 0.5rem; font-size: 1.125rem; overflow-wrap: anywhere; }
+  .download-job p { margin: 0.375rem 0; }
   .history-filters { display: flex; flex-wrap: wrap; align-items: end; gap: 0.5rem; }
   .history-filters div { display: grid; gap: 0.25rem; }
   .history-filters input, .history-filters select, .history-filters button { font: inherit; }
@@ -124,6 +128,7 @@ page = r"""
     <option value="mp3" {% if media_type == 'mp3' %}selected{% endif %}>MP3 audio only</option>
   </select>
   <button type="submit" name="action" value="check">Check size</button>
+  <div id="checked-result">
   {% if checked %}
     <div id="checked-video">
       <article class="video-preview" aria-labelledby="video-title">
@@ -166,7 +171,9 @@ page = r"""
       <button type="submit" name="action" value="download">Download</button>
     </div>
   {% endif %}
+  </div>
 </form>
+<div id="existing-result">
 {% if existing %}
   <section id="existing-video" aria-labelledby="existing-title">
     <article class="video-preview">
@@ -185,12 +192,23 @@ page = r"""
     </article>
   </section>
 {% endif %}
-<div id="download-progress" hidden>
-  <progress id="progress-bar" aria-label="Current download progress" max="100"></progress>
-  <p id="progress-details"></p>
-  <button id="cancel-download" type="button" hidden>Cancel download</button>
 </div>
 <p id="download-status" role="status">{{ message }}</p>
+<section id="download-jobs" aria-labelledby="jobs-title" hidden>
+  <h2 id="jobs-title">Downloads</h2>
+  <div id="download-job-list"></div>
+</section>
+<template id="download-job-template">
+  <article class="download-job">
+    <h3></h3>
+    <p class="job-status" role="status"></p>
+    <div class="job-progress">
+      <progress aria-label="Download progress" max="100"></progress>
+      <p class="job-details"></p>
+      <button class="cancel-download" type="button" hidden>Cancel download</button>
+    </div>
+  </article>
+</template>
 <section class="download-history" aria-labelledby="history-title">
   <h2 id="history-title">Download history</h2>
   <form id="history-filters" class="history-filters" method="get" action="{{ url_for('index') }}">
@@ -215,19 +233,17 @@ page = r"""
 </section>
 <script>
   const form = document.querySelector('#download-form');
-  const progress = document.querySelector('#download-progress');
-  const bar = document.querySelector('#progress-bar');
-  const details = document.querySelector('#progress-details');
-  const status = document.querySelector('#download-status');
-  const cancel = document.querySelector('#cancel-download');
-  const checkedVideo = document.querySelector('#checked-video');
-  const existingVideo = document.querySelector('#existing-video');
+  const checkStatus = document.querySelector('#download-status');
+  const checkedResult = document.querySelector('#checked-result');
+  const existingResult = document.querySelector('#existing-result');
+  const jobs = document.querySelector('#download-jobs');
+  const jobList = document.querySelector('#download-job-list');
+  const jobTemplate = document.querySelector('#download-job-template');
   const historyForm = document.querySelector('#history-filters');
   const historyEntries = document.querySelector('#history-entries');
   const historyStatus = document.querySelector('#history-status');
   const size = bytes => `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
-  let cancelUrl = null;
-  let cancelling = false;
+  let previewRequest;
   let historyFilters = new URLSearchParams(new FormData(historyForm));
   let historyRequest;
 
@@ -273,7 +289,7 @@ page = r"""
   }
 
   historyEntries.addEventListener('submit', event => openSavedDownload(event, historyStatus));
-  existingVideo?.addEventListener('submit', event => {
+  existingResult.addEventListener('submit', event => {
     openSavedDownload(event, document.querySelector('#existing-status'));
   });
 
@@ -283,32 +299,39 @@ page = r"""
       document.querySelector('#preview-size').textContent = event.target.dataset.size;
       return;
     }
-    if (checkedVideo) checkedVideo.hidden = true;
-    if (existingVideo && ['url', 'format'].includes(event.target.name)) existingVideo.hidden = true;
+    previewRequest?.abort();
+    checkedResult.replaceChildren();
+    checkStatus.textContent = '';
+    if (['url', 'format'].includes(event.target.name)) existingResult.replaceChildren();
   });
 
-  cancel.addEventListener('click', async () => {
-    if (!cancelUrl || cancelling) return;
-    const url = cancelUrl;
-    cancelling = true;
-    cancel.disabled = true;
-    status.textContent = 'Cancelling download…';
+  async function checkSize(data) {
+    previewRequest?.abort();
+    const controller = new AbortController();
+    previewRequest = controller;
+    checkedResult.replaceChildren();
+    checkStatus.textContent = 'Checking size…';
     try {
-      const response = await fetch(url, {method: 'POST'});
-      // The download may have finished before the cancellation request arrived.
-      if (!response.ok && response.status !== 404 && response.status !== 409) {
-        throw new Error('Cancellation failed');
-      }
+      const response = await fetch(form.getAttribute('action'), {
+        method: 'POST', body: data, signal: controller.signal,
+      });
+      const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+      if (controller.signal.aborted) return;
+      form.elements.quality.value = page.querySelector('#quality').value;
+      checkedResult.replaceChildren(...page.querySelector('#checked-result').childNodes);
+      existingResult.replaceChildren(...page.querySelector('#existing-result').childNodes);
+      checkStatus.textContent = page.querySelector('#download-status').textContent;
     } catch {
-      if (cancelUrl === url) {
-        cancelling = false;
-        cancel.disabled = false;
-        status.textContent = 'Could not cancel. Try again.';
+      if (!controller.signal.aborted) {
+        checkStatus.textContent = 'Could not check the size. Try again.';
       }
+    } finally {
+      if (previewRequest === controller) previewRequest = null;
     }
-  });
+  }
 
-  function showProgress(event) {
+  function showProgress(job, event) {
+    const {status, bar, details, progress} = job;
     if (status.textContent !== event.message) status.textContent = event.message;
     if (event.state === 'complete') {
       bar.value = 100;
@@ -341,15 +364,43 @@ page = r"""
     details.textContent = parts.join(' · ');
   }
 
-  form.addEventListener('submit', async event => {
-    if (event.submitter?.value !== 'download' || !window.ReadableStream || !window.TextDecoder) return;
-    event.preventDefault();
-    const data = new FormData(form);
-    data.set('action', 'download');
-    const controls = [...form.elements].filter(control => !control.disabled);
-    controls.forEach(control => { control.disabled = true; });
-    progress.hidden = false;
-    showProgress({message: 'Starting download…'});
+  async function startDownload(data, submitter) {
+    const card = jobTemplate.content.firstElementChild.cloneNode(true);
+    const title = document.querySelector('#video-title')?.textContent || data.get('url');
+    card.querySelector('h3').textContent = title;
+    const job = {
+      bar: card.querySelector('progress'),
+      details: card.querySelector('.job-details'),
+      progress: card.querySelector('.job-progress'),
+      status: card.querySelector('.job-status'),
+    };
+    const cancel = card.querySelector('.cancel-download');
+    let cancelUrl = null;
+    let cancelling = false;
+    cancel.addEventListener('click', async () => {
+      if (!cancelUrl || cancelling) return;
+      cancelling = true;
+      cancel.disabled = true;
+      job.status.textContent = 'Cancelling download…';
+      try {
+        const response = await fetch(cancelUrl, {method: 'POST'});
+        // The download may have finished before the cancellation request arrived.
+        if (!response.ok && response.status !== 404 && response.status !== 409) {
+          throw new Error('Cancellation failed');
+        }
+      } catch {
+        if (cancelUrl) {
+          cancelling = false;
+          cancel.disabled = false;
+          job.status.textContent = 'Could not cancel. Try again.';
+        }
+      }
+    });
+
+    jobList.prepend(card);
+    jobs.hidden = false;
+    if (submitter) submitter.disabled = true;
+    showProgress(job, {message: 'Starting download…'});
 
     const controller = new AbortController();
     try {
@@ -358,7 +409,7 @@ page = r"""
       });
       if (response.status === 400) {
         const {message} = await response.json();
-        showProgress({state: 'error', message});
+        showProgress(job, {state: 'error', message});
         return;
       }
       if (!response.ok || !response.headers.get('Content-Type')?.includes('application/x-ndjson')) {
@@ -383,20 +434,29 @@ page = r"""
           }
           finished = ['complete', 'error', 'cancelled'].includes(update.state);
           if (finished) cancel.hidden = true;
-          if (!cancelling || finished) showProgress(update);
+          if (!cancelling || finished) showProgress(job, update);
           if (update.history_saved) refreshHistory();
         }
       }
       if (!finished) throw new Error('Download connection closed');
     } catch {
       controller.abort();
-      showProgress({state: 'error', message: 'Download interrupted. Check the PowerShell window.'});
+      showProgress(job, {state: 'error', message: 'Download interrupted. Check the PowerShell window.'});
     } finally {
       cancelUrl = null;
-      cancelling = false;
       cancel.hidden = true;
-      controls.forEach(control => { control.disabled = false; });
+      if (submitter) submitter.disabled = false;
     }
+  }
+
+  form.addEventListener('submit', event => {
+    const action = event.submitter?.value || 'check';
+    if (action === 'download' && (!window.ReadableStream || !window.TextDecoder)) return;
+    event.preventDefault();
+    const data = new FormData(form);
+    data.set('action', action);
+    if (action === 'download') startDownload(data, event.submitter);
+    else checkSize(data);
   });
 </script>
 </html>
@@ -779,6 +839,14 @@ def download_events(command, url, download_id, cancel_url):
     if pause:
         yield event("error", pause, http_status=429)
         return
+    key = video_id(url) or url
+    with active_downloads_lock:
+        already_active = key in active_video_ids
+        if not already_active:
+            active_video_ids.add(key)
+    if already_active:
+        yield event("error", "This video is already downloading.", http_status=409)
+        return
     finished_video = None
     restriction = None
     try:
@@ -869,6 +937,9 @@ def download_events(command, url, download_id, cancel_url):
     except OSError as error:
         print(error, flush=True)
         yield event("error", download_failed)
+    finally:
+        with active_downloads_lock:
+            active_video_ids.remove(key)
 
 
 @app.route("/", methods=["GET", "POST"])
