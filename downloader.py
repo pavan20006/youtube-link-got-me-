@@ -66,6 +66,8 @@ app.jinja_loader = DictLoader({"history.html": """
       </li>
     {% endfor %}
   </ul>
+{% elif history_query or history_format %}
+  <p>No downloads match your filters.</p>
 {% else %}
   <p>No completed downloads yet.</p>
 {% endif %}
@@ -99,6 +101,9 @@ page = r"""
   .quality-comparison th, .quality-comparison td { text-align: left; padding: 0.5rem 0.375rem; border-bottom: 1px solid #b8bdc6; }
   .quality-comparison label { cursor: pointer; }
   .download-history { margin-top: 1.5rem; max-width: 38rem; }
+  .history-filters { display: flex; flex-wrap: wrap; align-items: end; gap: 0.5rem; }
+  .history-filters div { display: grid; gap: 0.25rem; }
+  .history-filters input, .history-filters select, .history-filters button { font: inherit; }
   .history-list { list-style: none; padding: 0; }
   .history-list li { padding: 0.75rem 0; border-bottom: 1px solid #b8bdc6; overflow-wrap: anywhere; }
   .history-list p { margin: 0.35rem 0; }
@@ -170,6 +175,21 @@ page = r"""
 <p id="download-status" role="status">{{ message }}</p>
 <section class="download-history" aria-labelledby="history-title">
   <h2 id="history-title">Download history</h2>
+  <form id="history-filters" class="history-filters" method="get" action="{{ url_for('index') }}">
+    <div>
+      <label for="history-query">Search by title</label>
+      <input id="history-query" type="search" name="history_query" value="{{ history_query }}" maxlength="200">
+    </div>
+    <div>
+      <label for="history-format">File format</label>
+      <select id="history-format" name="history_format">
+        <option value="">All formats</option>
+        <option value="MP4" {% if history_format == 'MP4' %}selected{% endif %}>MP4</option>
+        <option value="MP3" {% if history_format == 'MP3' %}selected{% endif %}>MP3</option>
+      </select>
+    </div>
+    <button type="submit">Filter history</button>
+  </form>
   <div id="history-entries" data-url="{{ url_for('download_history') }}">
     {% include 'history.html' %}
   </div>
@@ -183,21 +203,41 @@ page = r"""
   const status = document.querySelector('#download-status');
   const cancel = document.querySelector('#cancel-download');
   const checkedVideo = document.querySelector('#checked-video');
+  const historyForm = document.querySelector('#history-filters');
   const historyEntries = document.querySelector('#history-entries');
   const historyStatus = document.querySelector('#history-status');
   const size = bytes => `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
   let cancelUrl = null;
   let cancelling = false;
+  let historyFilters = new URLSearchParams(new FormData(historyForm));
+  let historyRequest;
 
   async function refreshHistory() {
+    historyRequest?.abort();
+    const controller = new AbortController();
+    historyRequest = controller;
+    const url = new URL(historyEntries.dataset.url, window.location.href);
+    url.search = historyFilters;
     try {
-      const response = await fetch(historyEntries.dataset.url, {cache: 'no-store'});
+      const response = await fetch(url, {cache: 'no-store', signal: controller.signal});
       if (!response.ok) throw new Error('History refresh failed');
-      historyEntries.innerHTML = await response.text();
+      const html = await response.text();
+      if (historyRequest === controller) {
+        historyEntries.innerHTML = html;
+        historyStatus.textContent = '';
+      }
     } catch {
-      historyStatus.textContent = 'Refresh the page to see your latest downloads.';
+      if (!controller.signal.aborted) {
+        historyStatus.textContent = 'Could not refresh download history. Try again.';
+      }
     }
   }
+
+  historyForm.addEventListener('submit', event => {
+    event.preventDefault();
+    historyFilters = new URLSearchParams(new FormData(historyForm));
+    refreshHistory();
+  });
 
   historyEntries.addEventListener('submit', async event => {
     if (!event.submitter) return;
@@ -252,7 +292,7 @@ page = r"""
     }
     if (event.state === 'error' || event.state === 'cancelled') progress.hidden = true;
 
-    const {downloaded, total, estimated, eta} = event;
+    const {downloaded, total, estimated, eta, speed} = event;
     const parts = [];
     if (total && downloaded != null) {
       const percent = Math.min(100, downloaded / total * 100);
@@ -261,6 +301,11 @@ page = r"""
     } else {
       bar.removeAttribute('value');
       if (downloaded != null) parts.push(`${size(downloaded)} downloaded`);
+    }
+    if (Number.isFinite(speed) && speed > 0) {
+      if (speed >= 1024 ** 2) parts.push(`${size(speed)}/s`);
+      else if (speed >= 1024) parts.push(`${(speed / 1024).toFixed(1)} KiB/s`);
+      else parts.push(`${Math.round(speed)} B/s`);
     }
     if (eta > 0) {
       const remaining = Math.ceil(eta);
@@ -389,36 +434,52 @@ def record_download(video):
         """, (str(path), video.get("title") or path.stem, media_type, height, size, downloaded_at))
 
 
-def history_rows(item_id=None):
+def history_rows(item_id=None, *, query="", media_format=""):
     if not history_database.is_file():
         return []
     with closing(sqlite3.connect(history_database)) as connection:
         connection.row_factory = sqlite3.Row
         if item_id is not None:
             return connection.execute("SELECT path FROM downloads WHERE id = ?", (item_id,)).fetchall()
+        connection.create_function("casefold", 1, str.casefold)
+        query = query.casefold()
         return connection.execute("""
             SELECT id, title, format, height, size, downloaded_at FROM downloads
+            WHERE (? = '' OR instr(casefold(title), ?) > 0)
+              AND (? = '' OR format = ?)
             ORDER BY downloaded_at DESC, id DESC LIMIT 50
-        """).fetchall()
+        """, (query, query, media_format, media_format)).fetchall()
 
 
-def recent_history():
+def recent_history(query, media_format):
     try:
         return [
             {
                 **dict(item), "size": format_mib(item["size"]),
                 "date": datetime.fromisoformat(item["downloaded_at"]).astimezone().strftime("%d %b %Y, %H:%M"),
             }
-            for item in history_rows()
+            for item in history_rows(query=query, media_format=media_format)
         ]
     except (OSError, sqlite3.Error, ValueError) as error:
         print(f"Could not read download history: {error}", flush=True)
         return []
 
 
+def history_context():
+    query = request.args.get("history_query", "").strip()[:200]
+    media_format = request.args.get("history_format", "").upper()
+    if media_format not in {"MP4", "MP3"}:
+        media_format = ""
+    return {
+        "history": recent_history(query, media_format),
+        "history_query": query,
+        "history_format": media_format,
+    }
+
+
 @app.get("/history")
 def download_history():
-    return render_template("history.html", history=recent_history())
+    return render_template("history.html", **history_context())
 
 
 @app.post("/history/<int:item_id>/open")
@@ -683,7 +744,7 @@ def download_events(command, url, download_id, cancel_url):
                 *command, "--progress", "--newline", "--progress-delta", "0.5",
                 "--progress-template",
                 f"download:{download_prefix}%(info.vcodec)j\t"
-                "%(progress.{status,downloaded_bytes,total_bytes,total_bytes_estimate,eta})j",
+                "%(progress.{status,downloaded_bytes,total_bytes,total_bytes_estimate,eta,speed})j",
                 "--progress-template", f"postprocess:{processing_prefix}%(progress.postprocessor)s",
                 "--print", f"after_move:{finished_file_prefix}" "%(.{filepath,title,height})j",
                 "--no-simulate", "--no-quiet", "--encoding", "utf-8",
@@ -725,7 +786,7 @@ def download_events(command, url, download_id, cancel_url):
                         yield event(
                             "downloading", message, downloaded=downloaded,
                             total=total or update.get("total_bytes_estimate"),
-                            estimated=not total, eta=update.get("eta"),
+                            estimated=not total, eta=update.get("eta"), speed=update.get("speed"),
                         )
                     else:
                         print(line, end="", flush=True)
@@ -834,5 +895,5 @@ def index():
     return render_template_string(
         page, link=link, quality=quality, qualities=qualities, media_type=media_type,
         message=message, checked=checked, size=size, preview=preview,
-        comparisons=comparisons, history=recent_history(),
+        comparisons=comparisons, **history_context(),
     ), http_status
