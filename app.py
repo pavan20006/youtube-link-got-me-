@@ -1,19 +1,19 @@
-import io
-import os
 import re
-import secrets
 import subprocess
 import tempfile
+from contextlib import ExitStack
 from pathlib import Path
+from threading import Lock
 from urllib.parse import parse_qs, urlsplit
 
-from flask import Flask, Response, render_template_string, request, send_file
+from flask import Flask, render_template_string, request, send_file
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 4096
 
-SITE_NAME = "My Video Downloader"
+SITE_NAME = "Video Downloader"
 MAX_BYTES = 25 * 1024 * 1024
+download_slot = Lock()
 
 PAGE = """
 <!doctype html>
@@ -22,21 +22,28 @@ PAGE = """
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ name }}</title>
 <style>
-  body { font: 1rem system-ui; max-width: 34rem; margin: 4rem auto; padding: 0 1rem; }
-  input, button { font: inherit; padding: .7rem; margin-top: .5rem; }
-  input { width: 100%; box-sizing: border-box; }
-  button { cursor: pointer; }
-  [role=alert] { color: #a31621; }
+  body { font: 1rem/1.5 system-ui; background: #f4f7fc; color: #172641; margin: 0; padding: 3rem 1rem; }
+  main { max-width: 35rem; margin: 0 auto; padding: clamp(1.25rem, 5vw, 2.5rem); background: white; border: 1px solid #c8d3e4; border-radius: 1rem; }
+  h1 { line-height: 1.15; margin-top: 0; }
+  label { display: block; margin-top: 1.5rem; font-weight: 600; }
+  input, button { font: inherit; padding: .7rem .9rem; margin-top: .5rem; border-radius: .5rem; }
+  input { width: 100%; box-sizing: border-box; border: 1px solid #6d7c91; }
+  button { cursor: pointer; border: 1px solid transparent; background: #1647a6; color: white; font-weight: 600; }
+  :focus-visible { outline: 2px solid #1647a6; outline-offset: 3px; }
+  [role=alert] { color: #951b2e; }
 </style>
+<main>
 <h1>{{ name }}</h1>
 <p>Download a short video you own or have permission to download.</p>
 <form method="post">
   <label for="url">YouTube video link</label>
-  <input id="url" name="url" type="url"
+  <input id="url" name="url" type="url" value="{{ link }}" maxlength="2048"
          placeholder="https://www.youtube.com/watch?v=..." required>
   <button type="submit">Download MP4</button>
 </form>
+<p>MP4 · Up to 480p · Up to 25 MiB</p>
 {% if error %}<p role="alert">{{ error }}</p>{% endif %}
+</main>
 </html>
 """
 
@@ -51,44 +58,39 @@ def video_id_from(url):
     if parts.hostname == "youtu.be":
         candidate = parts.path.removeprefix("/")
     elif parts.hostname in {"youtube.com", "www.youtube.com", "m.youtube.com"}:
-        if parts.path != "/watch":
+        if parts.path == "/watch":
+            candidate = parse_qs(parts.query).get("v", [""])[0]
+        elif parts.path.startswith("/shorts/"):
+            candidate = parts.path.removeprefix("/shorts/").rstrip("/")
+        else:
             return None
-        candidate = parse_qs(parts.query).get("v", [""])[0]
     else:
         return None
     return candidate if re.fullmatch(r"[A-Za-z0-9_-]{11}", candidate) else None
 
 
+@app.get("/healthz")
+def health():
+    return "OK"
+
 @app.route("/", methods=["GET", "POST"])
 def download():
-    password = os.environ.get("APP_PASSWORD")
-    if not password:
-        return "Set APP_PASSWORD in Railway Variables first.", 503
-
-    auth = request.authorization
-    if (
-        not auth
-        or auth.username != "owner"
-        or not secrets.compare_digest(
-            (auth.password or "").encode(), password.encode()
-        )
-    ):
-        return Response(
-            "Sign in to use the downloader.",
-            401,
-            {"WWW-Authenticate": 'Basic realm="Video Downloader"'},
-        )
+    def page(link="", error=""):
+        return render_template_string(PAGE, name=SITE_NAME, link=link, error=error)
 
     if request.method == "GET":
-        return render_template_string(PAGE, name=SITE_NAME)
+        return page()
 
-    video_id = video_id_from(request.form.get("url", "").strip())
+    link = request.form.get("url", "").strip()
+    video_id = video_id_from(link)
     if not video_id:
-        return render_template_string(
-            PAGE, name=SITE_NAME, error="Paste a YouTube video link."
-        ), 400
+        return page(link, "Paste a valid YouTube video or Shorts link."), 400
+    if not download_slot.acquire(blocking=False):
+        return page(link, "A download is in progress. Try again in a little while."), 503
 
-    with tempfile.TemporaryDirectory() as folder:
+    with ExitStack() as cleanup:
+        cleanup.callback(download_slot.release)
+        folder = cleanup.enter_context(tempfile.TemporaryDirectory())
         output = Path(folder) / "video.mp4"
         try:
             subprocess.run(
@@ -100,26 +102,35 @@ def download():
                     "--", f"https://www.youtube.com/watch?v={video_id}",
                 ],
                 check=True,
+                stderr=subprocess.PIPE,
+                encoding="utf-8",
+                errors="replace",
                 timeout=90,
             )
         except subprocess.TimeoutExpired:
-            return render_template_string(
-                PAGE, name=SITE_NAME, error="The download timed out. Try a shorter video."
-            ), 504
-        except subprocess.CalledProcessError:
-            return render_template_string(
-                PAGE, name=SITE_NAME,
-                error="The video could not be downloaded. Check the Railway logs for details.",
-            ), 502
+            return page(link, "The download timed out. Try a shorter video."), 504
+        except subprocess.CalledProcessError as error:
+            output_text = (error.stderr or "").lower()
+            if "http error 429" in output_text:
+                return page(link, "YouTube is rate-limiting requests. Try again later."), 429
+            if "sign in to confirm" in output_text and "not a bot" in output_text:
+                return page(link, "YouTube is asking for verification. Check whether the video plays on YouTube."), 403
+            return page(link, "The video could not be downloaded as an MP4. Try another video."), 502
+        except OSError:
+            return page(link, "The downloader is temporarily unavailable."), 503
 
-        if not output.is_file() or output.stat().st_size > MAX_BYTES:
-            return render_template_string(
-                PAGE, name=SITE_NAME, error="Try a smaller video with an MP4 format."
-            ), 422
+        if not output.is_file() or not 0 < output.stat().st_size <= MAX_BYTES:
+            return page(link, "Try a smaller video with an MP4 format."), 422
 
-        return send_file(
-            io.BytesIO(output.read_bytes()),
+        response = send_file(
+            cleanup.enter_context(output.open("rb")),
             mimetype="video/mp4",
             as_attachment=True,
             download_name=f"{video_id}.mp4",
+            conditional=False,
         )
+        response.content_length = output.stat().st_size
+        response.headers["Cache-Control"] = "no-store"
+        response.direct_passthrough = False
+        response.call_on_close(cleanup.pop_all().close)
+        return response
