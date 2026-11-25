@@ -12,7 +12,6 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 4096
 
 SITE_NAME = "Video Downloader"
-MAX_BYTES = 25 * 1024 * 1024
 download_slot = Lock()
 
 PAGE = """
@@ -34,14 +33,14 @@ PAGE = """
 </style>
 <main>
 <h1>{{ name }}</h1>
-<p>Download a short video you own or have permission to download.</p>
+<p>Download a video you own or have permission to download.</p>
 <form method="post">
   <label for="url">YouTube video link</label>
   <input id="url" name="url" type="url" value="{{ link }}" maxlength="2048"
          placeholder="https://www.youtube.com/watch?v=..." required>
   <button type="submit">Download MP4</button>
 </form>
-<p>MP4 · Up to 480p · Up to 25 MiB</p>
+<p>MP4 · Up to 480p</p>
 {% if error %}<p role="alert">{{ error }}</p>{% endif %}
 </main>
 </html>
@@ -97,7 +96,6 @@ def download():
                 [
                     "yt-dlp", "--ignore-config", "--no-playlist", "--no-progress",
                     "-f", "b[ext=mp4][height<=480]",
-                    "--max-filesize", "25M",
                     "-o", str(output),
                     "--", f"https://www.youtube.com/watch?v={video_id}",
                 ],
@@ -119,8 +117,9 @@ def download():
         except OSError:
             return page(link, "The downloader is temporarily unavailable."), 503
 
-        if not output.is_file() or not 0 < output.stat().st_size <= MAX_BYTES:
-            return page(link, "Try a smaller video with an MP4 format."), 422
+        content_length = output.stat().st_size if output.is_file() else 0
+        if content_length == 0:
+            return page(link, "No MP4 file was produced. Try another video."), 422
 
         response = send_file(
             cleanup.enter_context(output.open("rb")),
@@ -129,7 +128,7 @@ def download():
             download_name=f"{video_id}.mp4",
             conditional=False,
         )
-        response.content_length = output.stat().st_size
+        response.content_length = content_length
         response.headers["Cache-Control"] = "no-store"
         response.direct_passthrough = False
         response.call_on_close(cleanup.pop_all().close)
