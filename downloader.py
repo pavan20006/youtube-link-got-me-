@@ -49,9 +49,9 @@ preview_cache = OrderedDict()
 preview_cache_lock = Lock()
 preview_cache_seconds = 600
 preview_cache_capacity = 32
-youtube_pause_lock = Lock()
-youtube_pause_until = 0.0
-youtube_pause_seconds = 60
+platform_pause_lock = Lock()
+platform_pause_until = {}
+platform_pause_seconds = 60
 
 app.jinja_loader = DictLoader({"history.html": """
 {% if history %}
@@ -114,10 +114,10 @@ page = r"""
 </style>
 <h1>My Video Downloader</h1>
 <form id="download-form" method="post" action="{{ url_for('index') }}">
-  <label for="url">YouTube video link</label>
+  <label for="url">YouTube or Instagram video link</label>
   <input id="url" name="url" type="url" value="{{ link }}" required>
   <label for="quality">Video quality</label>
-  <select id="quality" name="quality">
+  <select id="quality" name="quality" {% if is_instagram %}disabled{% endif %}>
     {% for value, label in qualities.items() %}
       <option value="{{ value }}" {% if value == quality %}selected{% endif %}>{{ label }}</option>
     {% endfor %}
@@ -132,8 +132,12 @@ page = r"""
   {% if checked %}
     <div id="checked-video">
       <article class="video-preview" aria-labelledby="video-title">
+        {% if is_instagram and preview.thumbnail %}
+        <img src="{{ preview.thumbnail }}" alt="" width="192" height="144" referrerpolicy="no-referrer">
+        {% elif not is_instagram %}
         <img src="https://i.ytimg.com/vi/{{ preview.id }}/hqdefault.jpg" alt=""
              width="192" height="144" referrerpolicy="no-referrer">
+        {% endif %}
         <div>
           <h2 id="video-title">{{ preview.title }}</h2>
           <p>Duration: {{ preview.duration }}</p>
@@ -243,6 +247,7 @@ page = r"""
   const historyEntries = document.querySelector('#history-entries');
   const historyStatus = document.querySelector('#history-status');
   const size = bytes => `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+  let youtubeQuality = form.elements.quality.disabled ? '720' : form.elements.quality.value;
   let previewRequest;
   let historyFilters = new URLSearchParams(new FormData(historyForm));
   let historyRequest;
@@ -296,6 +301,7 @@ page = r"""
   form.addEventListener('input', event => {
     if (event.target.name === 'compared_quality') {
       form.elements.quality.value = event.target.value;
+      youtubeQuality = event.target.value;
       document.querySelector('#preview-size').textContent = event.target.dataset.size;
       return;
     }
@@ -303,6 +309,11 @@ page = r"""
     checkedResult.replaceChildren();
     checkStatus.textContent = '';
     if (['url', 'format'].includes(event.target.name)) existingResult.replaceChildren();
+    if (event.target.name === 'quality') youtubeQuality = event.target.value;
+    if (event.target.name === 'url' && form.elements.quality.disabled) {
+      form.elements.quality.disabled = false;
+      form.elements.quality.value = youtubeQuality;
+    }
   });
 
   async function checkSize(data) {
@@ -317,7 +328,10 @@ page = r"""
       });
       const page = new DOMParser().parseFromString(await response.text(), 'text/html');
       if (controller.signal.aborted) return;
-      form.elements.quality.value = page.querySelector('#quality').value;
+      const quality = page.querySelector('#quality');
+      form.elements.quality.value = quality.value;
+      form.elements.quality.disabled = quality.disabled;
+      if (!quality.disabled) youtubeQuality = quality.value;
       checkedResult.replaceChildren(...page.querySelector('#checked-result').childNodes);
       existingResult.replaceChildren(...page.querySelector('#existing-result').childNodes);
       checkStatus.textContent = page.querySelector('#download-status').textContent;
@@ -477,6 +491,50 @@ def video_id(link):
         if url.path.startswith("/shorts/"):
             return url.path.removeprefix("/shorts/").strip("/")
     return ""
+
+
+@dataclass(frozen=True)
+class VideoSource:
+    platform: str
+    key: str
+    url: str
+
+
+def video_source_from(link):
+    try:
+        parts = urlsplit(link)
+    except ValueError:
+        return None
+    if parts.scheme != "https" or parts.username is not None:
+        return None
+    if parts.hostname in {"instagram.com", "www.instagram.com"}:
+        post = re.fullmatch(
+            r"/(?:(?!share/)[A-Za-z0-9_.]{1,30}/)?(p|reels?|tv)/([A-Za-z0-9_-]{5,28})/?",
+            parts.path,
+        )
+        if not post or (post.group(1), post.group(2)) == ("reels", "audio"):
+            return None
+        kind, key = post.groups()
+        if kind == "reels":
+            kind = "reel"
+        return VideoSource("Instagram", key, f"https://www.instagram.com/{kind}/{key}/")
+    key = video_id(link)
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", key):
+        return VideoSource("YouTube", key, f"https://www.youtube.com/watch?v={key}")
+    return None
+
+
+def instagram_thumbnail(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return None
+    host = parts.hostname or ""
+    if parts.scheme == "https" and parts.username is None and host.endswith((".cdninstagram.com", ".fbcdn.net")):
+        return value
+    return None
 
 
 def format_mib(size):
@@ -649,6 +707,18 @@ def video_format(quality):
     return f"bv*[height<={quality}]+ba/b[height<={quality}]"
 
 
+def download_options(platform, media_type, quality="best"):
+    options = ["--playlist-items", "1"] if platform == "Instagram" else []
+    if media_type == "mp3":
+        return [*options, "-x", "--audio-format", "mp3"]
+    if platform == "Instagram":
+        return [*options, "-f", "b[ext=mp4]/bv[ext=mp4]+ba[ext=m4a]", "--merge-output-format", "mp4"]
+    options = ["-t", "mp4"]
+    if quality != "best":
+        options += ["-f", video_format(quality)]
+    return options
+
+
 def compare_video_formats(metadata):
     # Each selector has a fallback so yt-dlp emits one result per requested limit.
     # Validate the returned resolution before offering that row as a download.
@@ -734,26 +804,29 @@ def cancel_download(download_id):
         return "", 202 if job.cancelled else 409
 
 
-def youtube_restriction(output):
+def platform_restriction(output, platform):
     output = output.lower()
-    if "http error 429" in output or "429 too many requests" in output:
-        return 429, "YouTube is rate-limiting requests. Wait a while before trying again."
-    if "sign in to confirm" in output and "not a bot" in output:
+    if any(reason in output for reason in ("http error 429", "429 too many requests", "exceeded the rate-limit")):
+        return 429, f"{platform} is rate-limiting requests. Wait a while before trying again."
+    if platform == "Instagram" and any(reason in output for reason in (
+        "login required", "only available for registered users", "restricted video", "redirected to the login page",
+    )):
+        return 403, "Instagram requires sign-in for this video. Try a public post or Reel."
+    if platform == "YouTube" and "sign in to confirm" in output and "not a bot" in output:
         return 403, "YouTube is asking for verification. Open the video on YouTube to check whether it plays."
     return None
 
 
-def pause_youtube_requests():
-    global youtube_pause_until
-    with youtube_pause_lock:
-        youtube_pause_until = monotonic() + youtube_pause_seconds
+def pause_platform_requests(platform):
+    with platform_pause_lock:
+        platform_pause_until[platform] = monotonic() + platform_pause_seconds
 
 
-def youtube_pause_message():
-    with youtube_pause_lock:
-        remaining = ceil(youtube_pause_until - monotonic())
+def platform_pause_message(platform):
+    with platform_pause_lock:
+        remaining = ceil(platform_pause_until.get(platform, 0) - monotonic())
     if remaining > 0:
-        return f"The app is pausing YouTube requests for {remaining} more seconds. YouTube may need longer."
+        return f"The app is pausing {platform} requests for {remaining} more seconds. {platform} may need longer."
     return None
 
 
@@ -764,18 +837,20 @@ class PreviewRequestError(Exception):
 
 
 def lookup_preview(key, media_type, url):
-    cache_key = (key, media_type)
+    source = video_source_from(url)
+    platform = source.platform if source else "YouTube"
+    cache_key = (platform, key, media_type)
     with preview_cache_lock:
         # Serialize metadata lookups so simultaneous checks can share the same result.
         cached = preview_cache.get(cache_key)
         if cached and cached[0] > monotonic():
             preview_cache.move_to_end(cache_key)
             return cached[1]
-        pause = youtube_pause_message()
+        pause = platform_pause_message(platform)
         if pause:
             raise PreviewRequestError(pause, 429)
 
-        options = ["-t", "mp4"] if media_type == "mp4" else ["-x", "--audio-format", "mp3"]
+        options = download_options(platform, media_type)
         failure = "Could not check the size. Check the PowerShell window."
         try:
             result = subprocess.run(
@@ -784,18 +859,24 @@ def lookup_preview(key, media_type, url):
                 encoding="utf-8", errors="replace", timeout=30,
             )
             video = json.loads(result.stdout)
-            preview = {"id": key, "title": video.get("title") or "YouTube video", "duration": video_duration(video)}
+            if platform == "Instagram" and video.get("_type") == "playlist":
+                video = next((entry for entry in (video.get("entries") or []) if isinstance(entry, dict)), None)
+                if video is None:
+                    raise PreviewRequestError("No video was found in this Instagram post.")
+            preview = {"id": key, "title": video.get("title") or f"{platform} video", "duration": video_duration(video)}
+            if platform == "Instagram":
+                preview["thumbnail"] = instagram_thumbnail(video.get("thumbnail"))
         except subprocess.TimeoutExpired as error:
             raise PreviewRequestError("The size check timed out. Try again.") from error
         except subprocess.CalledProcessError as error:
             output = error.stderr or ""
             if output:
                 print(output, end="", file=sys.stderr, flush=True)
-            restriction = youtube_restriction(output)
+            restriction = platform_restriction(output, platform)
             if restriction:
                 http_status, message = restriction
                 if http_status == 429:
-                    pause_youtube_requests()
+                    pause_platform_requests(platform)
                 raise PreviewRequestError(message, http_status) from error
             raise PreviewRequestError(failure) from error
         except (OSError, ValueError) as error:
@@ -805,7 +886,7 @@ def lookup_preview(key, media_type, url):
             print(result.stderr, end="", file=sys.stderr, flush=True)
         comparisons = []
         message = ""
-        if media_type == "mp4":
+        if media_type == "mp4" and platform == "YouTube":
             available = {"best": video}
             try:
                 available.update(compare_video_formats(result.stdout))
@@ -835,11 +916,13 @@ def download_events(command, url, download_id, cancel_url):
     def event(state, message, **details):
         return json.dumps({"state": state, "message": message, **details}) + "\n"
 
-    pause = youtube_pause_message()
+    source = video_source_from(url)
+    platform = source.platform if source else "YouTube"
+    pause = platform_pause_message(platform)
     if pause:
         yield event("error", pause, http_status=429)
         return
-    key = video_id(url) or url
+    key = (platform, source.key) if source else url
     with active_downloads_lock:
         already_active = key in active_video_ids
         if not already_active:
@@ -902,7 +985,7 @@ def download_events(command, url, download_id, cancel_url):
                         )
                     else:
                         print(line, end="", flush=True)
-                        blocked = youtube_restriction(line)
+                        blocked = platform_restriction(line, platform)
                         if blocked and (restriction is None or blocked[0] == 429):
                             restriction = blocked
                 returncode = process.wait()
@@ -930,7 +1013,7 @@ def download_events(command, url, download_id, cancel_url):
         elif restriction:
             http_status, message = restriction
             if http_status == 429:
-                pause_youtube_requests()
+                pause_platform_requests(platform)
             yield event("error", message, http_status=http_status)
         else:
             yield event("error", download_failed)
@@ -959,27 +1042,27 @@ def index():
     preview = None
     existing = None
     comparisons = []
+    is_instagram = False
     http_status = 200
     streaming = request.headers.get("Accept") == progress_type
     if request.method == "POST":
-        key = video_id(link)
-        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", key):
-            message = "Paste a YouTube video or Shorts link."
+        source = video_source_from(link)
+        if not source:
+            message = "Paste a YouTube video or a public Instagram video post or Reel link."
         else:
-            options = ["-t", "mp4"]
-
-            if media_type == "mp3":
-                options = ["-x", "--audio-format", "mp3"]
-            elif quality != "best":
-                options += ["-f", video_format(quality)]
-
+            is_instagram = source.platform == "Instagram"
+            if is_instagram:
+                quality = "best"
+            options = download_options(source.platform, media_type, quality)
+            history_key = f"instagram-{source.key}" if is_instagram else source.key
+            if is_instagram:
+                options += ["-o", f"%(title)s [{history_key}].%(ext)s"]
             command = [*yt_dlp_command, *options]
-            url = f"https://www.youtube.com/watch?v={key}"
-            selection = f"{key}:{quality}:{media_type}"
+            selection = f"{history_key}:{quality}:{media_type}"
             if downloading and selection in request.form.getlist("checked"):
                 download_id = uuid4().hex
                 cancel_url = url_for("cancel_download", download_id=download_id)
-                events = download_events(command, url, download_id, cancel_url)
+                events = download_events(command, source.url, download_id, cancel_url)
                 if streaming:
                     return Response(
                         events, mimetype=progress_type,
@@ -992,20 +1075,20 @@ def index():
             else:
                 if streaming:
                     return {"message": "Check the size for these settings before downloading."}, 400
-                existing = find_existing_download(key, media_type)
+                existing = find_existing_download(history_key, media_type)
                 if not existing or action == "check-online":
                     try:
-                        preview, sizes, comparisons, message = lookup_preview(key, media_type, url)
+                        preview, sizes, comparisons, message = lookup_preview(source.key, media_type, source.url)
                     except PreviewRequestError as error:
                         http_status, message = error.http_status, str(error)
                     else:
-                        if media_type == "mp4":
+                        if media_type == "mp4" and not is_instagram:
                             if quality not in sizes:
                                 quality = "best"
                                 if comparisons:
                                     message = "That quality is unavailable. Choose an available row below."
                             size = sizes[quality]
-                            checked = [f"{key}:{limit}:mp4" for limit in sizes]
+                            checked = [f"{source.key}:{limit}:mp4" for limit in sizes]
                         else:
                             size = sizes["best"]
                             checked = [selection]
@@ -1014,5 +1097,5 @@ def index():
     return render_template_string(
         page, link=link, quality=quality, qualities=qualities, media_type=media_type,
         message=message, checked=checked, size=size, preview=preview, existing=existing,
-        comparisons=comparisons, **history_context(),
+        comparisons=comparisons, is_instagram=is_instagram, **history_context(),
     ), http_status
