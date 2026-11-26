@@ -105,6 +105,9 @@ page = r"""
   .photo-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr)); gap: 0.75rem; padding: 0; list-style: none; }
   .photo-grid img { display: block; width: 100%; aspect-ratio: 1; object-fit: contain; background: #edf0f4; }
   .photo-grid span { display: block; margin-top: 0.25rem; }
+  .photo-grid label { display: block; padding: 0.25rem; border-radius: 0.25rem; cursor: pointer; }
+  .photo-grid label:has(:checked) { outline: 2px solid #1647a6; background: #eaf0ff; }
+  .photo-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.75rem; }
   .quality-comparison { margin: 0 0 1rem; min-width: 0; max-width: 37.5rem; }
   .quality-comparison table { width: 100%; border-collapse: collapse; }
   .quality-comparison th, .quality-comparison td { text-align: left; padding: 0.5rem 0.375rem; border-bottom: 1px solid #b8bdc6; }
@@ -152,11 +155,20 @@ page = r"""
           {% if media_type != 'image' %}<p>Duration: {{ preview.duration }}</p>{% endif %}
           {% if preview.photos | length > 1 %}
           <p>{{ preview.photos | length }} photos</p>
+          <div class="photo-actions">
+            <button type="button" data-photo-selection="all" hidden>Select all</button>
+            <button type="button" data-photo-selection="clear" hidden>Clear selection</button>
+            <button type="submit" name="action" value="download-selected">Download selected</button>
+            <button type="submit" name="action" value="download">Download all photos</button>
+          </div>
+          <p id="photo-selection-status" role="status" hidden></p>
           <ul class="photo-grid">
             {% for photo in preview.photos %}
             <li>
-              <img src="{{ photo.url }}" alt="" width="160" height="160" loading="lazy" referrerpolicy="no-referrer">
-              <span>Slide {{ photo.position }}</span>
+              <label>
+                <img src="{{ photo.url }}" alt="" width="160" height="160" loading="lazy" referrerpolicy="no-referrer">
+                <span><input type="checkbox" name="photo_position" value="{{ photo.position }}"> Slide {{ photo.position }}</span>
+              </label>
             </li>
             {% endfor %}
           </ul>
@@ -193,7 +205,9 @@ page = r"""
       {% for selection in checked %}
         <input type="hidden" name="checked" value="{{ selection }}">
       {% endfor %}
-      <button type="submit" name="action" value="download">{{ 'Download all photos' if preview.photos | length > 1 else 'Download image' if media_type == 'image' else 'Download' }}</button>
+      {% if preview.photos | length <= 1 %}
+      <button type="submit" name="action" value="download">{{ 'Download image' if media_type == 'image' else 'Download' }}</button>
+      {% endif %}
     </div>
   {% endif %}
   </div>
@@ -320,7 +334,33 @@ page = r"""
     openSavedDownload(event, document.querySelector('#existing-status'));
   });
 
+  function updatePhotoSelection() {
+    const feedback = checkedResult.querySelector('#photo-selection-status');
+    if (!feedback) return;
+    const inputs = checkedResult.querySelectorAll('input[name="photo_position"]');
+    const count = checkedResult.querySelectorAll('input[name="photo_position"]:checked').length;
+    const submit = checkedResult.querySelector('button[value="download-selected"]');
+    submit.disabled = count === 0 || submit.getAttribute('aria-busy') === 'true';
+    feedback.hidden = false;
+    feedback.textContent = `${count} of ${inputs.length} selected`;
+    checkedResult.querySelectorAll('button[data-photo-selection]').forEach(button => { button.hidden = false; });
+  }
+
+  checkedResult.addEventListener('click', event => {
+    const button = event.target.closest('button[data-photo-selection]');
+    if (!button) return;
+    checkedResult.querySelectorAll('input[name="photo_position"]').forEach(input => {
+      input.checked = button.dataset.photoSelection === 'all';
+    });
+    updatePhotoSelection();
+  });
+
+  updatePhotoSelection();
   form.addEventListener('input', event => {
+    if (event.target.name === 'photo_position') {
+      updatePhotoSelection();
+      return;
+    }
     if (event.target.name === 'compared_quality') {
       form.elements.quality.value = event.target.value;
       youtubeQuality = event.target.value;
@@ -355,6 +395,7 @@ page = r"""
       form.elements.quality.disabled = quality.disabled;
       if (!quality.disabled) youtubeQuality = quality.value;
       checkedResult.replaceChildren(...page.querySelector('#checked-result').childNodes);
+      updatePhotoSelection();
       existingResult.replaceChildren(...page.querySelector('#existing-result').childNodes);
       checkStatus.textContent = page.querySelector('#download-status').textContent;
     } catch {
@@ -440,7 +481,10 @@ page = r"""
 
     jobList.prepend(card);
     jobs.hidden = false;
-    if (submitter) submitter.disabled = true;
+    if (submitter) {
+      submitter.disabled = true;
+      submitter.setAttribute('aria-busy', 'true');
+    }
     showProgress(job, {message: 'Starting download…'});
 
     const controller = new AbortController();
@@ -486,17 +530,22 @@ page = r"""
     } finally {
       cancelUrl = null;
       cancel.hidden = true;
-      if (submitter) submitter.disabled = false;
+      if (submitter) {
+        submitter.disabled = false;
+        submitter.removeAttribute('aria-busy');
+        updatePhotoSelection();
+      }
     }
   }
 
   form.addEventListener('submit', event => {
     const action = event.submitter?.value || 'check';
-    if (action === 'download' && (!window.ReadableStream || !window.TextDecoder)) return;
+    const downloading = action === 'download' || action === 'download-selected';
+    if (downloading && (!window.ReadableStream || !window.TextDecoder)) return;
     event.preventDefault();
     const data = new FormData(form);
     data.set('action', action);
-    if (action === 'download') startDownload(data, event.submitter);
+    if (downloading) startDownload(data, event.submitter);
     else checkSize(data);
   });
 </script>
@@ -1084,7 +1133,7 @@ def save_photo(photo, opener, job, show_bytes):
     return path
 
 
-def photo_download_events(source, download_id, cancel_url):
+def photo_download_events(source, download_id, cancel_url, selected_positions=None):
     pause = platform_pause_message(source.platform)
     if pause:
         yield download_event("error", pause, http_status=429)
@@ -1101,6 +1150,14 @@ def photo_download_events(source, download_id, cancel_url):
         yield download_event("starting", "Starting photo download…", cancel_url=cancel_url)
         preview, _, _, _ = lookup_preview(source.key, "image", source.url)
         photos = preview["photos"]
+        is_carousel = len(photos) > 1
+        if selected_positions is not None:
+            positions = set(selected_positions)
+            available = {str(photo["position"]) for photo in photos}
+            if not positions or not positions <= available:
+                yield download_event("error", "Select at least one available photo from this post.", http_status=400)
+                return
+            photos = [photo for photo in photos if str(photo["position"]) in positions]
         count = len(photos)
         saved = 0
         history_saved = False
@@ -1133,7 +1190,7 @@ def photo_download_events(source, download_id, cancel_url):
                 break
 
             saved += 1
-            title = f"{preview['title']} · Slide {photo['position']}" if count > 1 else preview["title"]
+            title = f"{preview['title']} · Slide {photo['position']}" if is_carousel else preview["title"]
             try:
                 record_download({"filepath": str(path), "title": title})
             except (OSError, sqlite3.Error, ValueError) as error:
@@ -1291,7 +1348,7 @@ def index():
     if media_type not in {"mp4", "mp3", "image"}:
         media_type = "mp4"
     action = request.form.get("action")
-    downloading = action == "download"
+    downloading = action in {"download", "download-selected"}
     if downloading and media_type == "mp4":
         quality = request.form.get("compared_quality", quality)
     if quality not in qualities:
@@ -1311,6 +1368,8 @@ def index():
             message = "Paste a YouTube video link or a public Instagram post or Reel link."
         elif media_type == "image" and not source.url.startswith("https://www.instagram.com/p/"):
             message = "Choose Instagram photo with a public Instagram photo post link."
+        elif action == "download-selected" and media_type != "image":
+            message, http_status = "Choose Instagram photo to select slides.", 400
         else:
             is_instagram = source.platform == "Instagram"
             if is_instagram:
@@ -1325,7 +1384,8 @@ def index():
                 download_id = uuid4().hex
                 cancel_url = url_for("cancel_download", download_id=download_id)
                 if media_type == "image":
-                    events = photo_download_events(source, download_id, cancel_url)
+                    positions = request.form.getlist("photo_position") if action == "download-selected" else None
+                    events = photo_download_events(source, download_id, cancel_url, positions)
                 else:
                     events = download_events(command, source.url, download_id, cancel_url)
                 if streaming:
