@@ -2,6 +2,7 @@ import re
 import subprocess
 import tempfile
 from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 from urllib.parse import parse_qs, urlsplit
@@ -13,6 +14,14 @@ app.config["MAX_CONTENT_LENGTH"] = 4096
 
 SITE_NAME = "Video Downloader"
 download_slot = Lock()
+
+
+@dataclass(frozen=True)
+class VideoSource:
+    platform: str
+    video_id: str
+    url: str
+
 
 PAGE = """
 <!doctype html>
@@ -35,25 +44,36 @@ PAGE = """
 <h1>{{ name }}</h1>
 <p>Download a video you own or have permission to download.</p>
 <form method="post">
-  <label for="url">YouTube video link</label>
+  <label for="url">YouTube or Instagram video link</label>
   <input id="url" name="url" type="url" value="{{ link }}" maxlength="2048"
-         placeholder="https://www.youtube.com/watch?v=..." required>
+         placeholder="Paste a video or Reel link" required>
   <button type="submit">Download MP4</button>
 </form>
-<p>MP4 · Up to 480p</p>
+<p>YouTube up to 480p. Instagram public video posts and Reels.</p>
 {% if error %}<p role="alert">{{ error }}</p>{% endif %}
 </main>
 </html>
 """
 
 
-def video_id_from(url):
+def video_source_from(url):
     try:
         parts = urlsplit(url)
     except ValueError:
         return None
-    if parts.scheme != "https":
+    if parts.scheme != "https" or parts.username is not None:
         return None
+    if parts.hostname in {"instagram.com", "www.instagram.com"}:
+        post = re.fullmatch(
+            r"/(?:(?!share/)[A-Za-z0-9_.]{1,30}/)?(p|reels?|tv)/([A-Za-z0-9_-]{5,28})/?",
+            parts.path,
+        )
+        if not post or (post.group(1), post.group(2)) == ("reels", "audio"):
+            return None
+        kind, shortcode = post.groups()
+        if kind == "reels":
+            kind = "reel"
+        return VideoSource("Instagram", shortcode, f"https://www.instagram.com/{kind}/{shortcode}/")
     if parts.hostname == "youtu.be":
         candidate = parts.path.removeprefix("/")
     elif parts.hostname in {"youtube.com", "www.youtube.com", "m.youtube.com"}:
@@ -65,12 +85,15 @@ def video_id_from(url):
             return None
     else:
         return None
-    return candidate if re.fullmatch(r"[A-Za-z0-9_-]{11}", candidate) else None
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", candidate):
+        return None
+    return VideoSource("YouTube", candidate, f"https://www.youtube.com/watch?v={candidate}")
 
 
 @app.get("/healthz")
 def health():
     return "OK"
+
 
 @app.route("/", methods=["GET", "POST"])
 def download():
@@ -81,9 +104,9 @@ def download():
         return page()
 
     link = request.form.get("url", "").strip()
-    video_id = video_id_from(link)
-    if not video_id:
-        return page(link, "Paste a valid YouTube video or Shorts link."), 400
+    source = video_source_from(link)
+    if not source:
+        return page(link, "Paste a YouTube video link or a public Instagram video post or Reel link."), 400
     if not download_slot.acquire(blocking=False):
         return page(link, "A download is in progress. Try again in a little while."), 503
 
@@ -91,13 +114,15 @@ def download():
         cleanup.callback(download_slot.release)
         folder = cleanup.enter_context(tempfile.TemporaryDirectory())
         output = Path(folder) / "video.mp4"
+        if source.platform == "Instagram":
+            options = ["--playlist-items", "1", "-f", "b[ext=mp4]/bv[ext=mp4]+ba[ext=m4a]", "--merge-output-format", "mp4"]
+        else:
+            options = ["-f", "b[ext=mp4][height<=480]"]
         try:
             subprocess.run(
                 [
                     "yt-dlp", "--ignore-config", "--no-playlist", "--no-progress",
-                    "-f", "b[ext=mp4][height<=480]",
-                    "-o", str(output),
-                    "--", f"https://www.youtube.com/watch?v={video_id}",
+                    *options, "-o", str(output), "--", source.url,
                 ],
                 check=True,
                 stderr=subprocess.PIPE,
@@ -106,10 +131,15 @@ def download():
             )
         except subprocess.CalledProcessError as error:
             output_text = (error.stderr or "").lower()
-            if "http error 429" in output_text:
-                return page(link, "YouTube is rate-limiting requests. Try again later."), 429
-            if "sign in to confirm" in output_text and "not a bot" in output_text:
-                return page(link, "YouTube is asking for verification. Check whether the video plays on YouTube."), 403
+            if "http error 429" in output_text or "exceeded the rate-limit" in output_text:
+                return page(link, f"{source.platform} is rate-limiting requests. Try again later."), 429
+            if (
+                "sign in to confirm" in output_text
+                or "login required" in output_text
+                or "only available for registered users" in output_text
+                or "restricted video" in output_text
+            ):
+                return page(link, f"{source.platform} requires sign-in or verification for this video. Try a public video."), 403
             return page(link, "The video could not be downloaded as an MP4. Try another video."), 502
         except OSError:
             return page(link, "The downloader is temporarily unavailable."), 503
@@ -122,7 +152,7 @@ def download():
             cleanup.enter_context(output.open("rb")),
             mimetype="video/mp4",
             as_attachment=True,
-            download_name=f"{video_id}.mp4",
+            download_name=f"{source.video_id}.mp4",
             conditional=False,
         )
         response.content_length = content_length
