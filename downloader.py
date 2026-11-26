@@ -5,6 +5,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from collections import OrderedDict
 from contextlib import closing
 from dataclasses import dataclass
@@ -36,11 +37,12 @@ processing_prefix = "DOWNLOADER_PROCESSING "
 finished_file_prefix = "DOWNLOADER_FILE "
 download_complete = "Download complete. Open your Downloads folder."
 download_failed = "Download failed. Check the PowerShell window."
+photo_types = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
 
 
 @dataclass
 class ActiveDownload:
-    process: subprocess.Popen
+    process: subprocess.Popen | None = None
     cancelled: bool = False
 
 
@@ -116,7 +118,7 @@ page = r"""
 </style>
 <h1>My Video Downloader</h1>
 <form id="download-form" method="post" action="{{ url_for('index') }}">
-  <label for="url">YouTube or Instagram video link</label>
+  <label for="url">YouTube or Instagram link</label>
   <input id="url" name="url" type="url" value="{{ link }}" required>
   <label for="quality">Video quality</label>
   <select id="quality" name="quality" {% if is_instagram %}disabled{% endif %}>
@@ -128,6 +130,7 @@ page = r"""
   <select id="format" name="format">
     <option value="mp4">MP4 video with sound</option>
     <option value="mp3" {% if media_type == 'mp3' %}selected{% endif %}>MP3 audio only</option>
+    <option value="image" {% if media_type == 'image' %}selected{% endif %}>Instagram photo</option>
   </select>
   <button type="submit" name="action" value="check">Check size</button>
   <div id="checked-result">
@@ -142,7 +145,7 @@ page = r"""
         {% endif %}
         <div>
           <h2 id="video-title">{{ preview.title }}</h2>
-          <p>Duration: {{ preview.duration }}</p>
+          {% if media_type != 'image' %}<p>Duration: {{ preview.duration }}</p>{% endif %}
           <p id="preview-size" role="status">{{ size }}</p>
         </div>
       </article>
@@ -174,7 +177,7 @@ page = r"""
       {% for selection in checked %}
         <input type="hidden" name="checked" value="{{ selection }}">
       {% endfor %}
-      <button type="submit" name="action" value="download">Download</button>
+      <button type="submit" name="action" value="download">{{ 'Download image' if media_type == 'image' else 'Download' }}</button>
     </div>
   {% endif %}
   </div>
@@ -228,6 +231,7 @@ page = r"""
         <option value="">All formats</option>
         <option value="MP4" {% if history_format == 'MP4' %}selected{% endif %}>MP4</option>
         <option value="MP3" {% if history_format == 'MP3' %}selected{% endif %}>MP3</option>
+        <option value="PHOTOS" {% if history_format == 'PHOTOS' %}selected{% endif %}>Photos</option>
       </select>
     </div>
     <button type="submit">Filter history</button>
@@ -553,7 +557,7 @@ class InstagramCDNRedirect(HTTPRedirectHandler):
         return redirected
 
 
-def instagram_track_size(track):
+def instagram_track_size(track, *, photo=False):
     url = instagram_cdn_url(track.get("url"))
     if not url or track.get("fragments") or track.get("protocol") not in (None, "http", "https"):
         return None
@@ -568,9 +572,9 @@ def instagram_track_size(track):
             with opener.open(Request(url, headers=request_headers, method=method), timeout=3) as response:
                 media_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
                 encoding = response.headers.get("Content-Encoding", "identity").strip().lower()
+                expected_type = media_type in photo_types if photo else media_type.startswith(("video/", "audio/"))
                 if encoding != "identity" or (
-                    media_type and not media_type.startswith(("video/", "audio/"))
-                    and media_type not in {"application/octet-stream", "binary/octet-stream"}
+                    media_type and not expected_type and media_type not in {"application/octet-stream", "binary/octet-stream"}
                 ):
                     continue
                 if response.status == 206:
@@ -596,7 +600,7 @@ def format_mib(size):
 
 def local_download_path(value):
     path = Path(value).resolve()
-    if not path.is_relative_to(downloads.resolve()) or path.suffix.lower() not in {".mp4", ".mp3"}:
+    if not path.is_relative_to(downloads.resolve()) or path.suffix.lower() not in {".mp4", ".mp3", *photo_types.values()}:
         raise ValueError("File is outside the supported downloads")
     return path
 
@@ -642,17 +646,20 @@ def history_rows(item_id=None, *, query="", media_format="", filename_suffix="")
         return connection.execute("""
             SELECT id, path, title, format, height, size, downloaded_at FROM downloads
             WHERE (? = '' OR instr(casefold(title), ?) > 0)
-              AND (? = '' OR format = ?)
+              AND (? = '' OR format = ? OR (? = 'PHOTOS' AND format IN ('JPG', 'PNG', 'WEBP')))
               AND (? = '' OR substr(path, -length(?)) = ?)
             ORDER BY downloaded_at DESC, id DESC LIMIT 50
-        """, (query, query, media_format, media_format, filename_suffix, filename_suffix, filename_suffix)).fetchall()
+        """, (query, query, media_format, media_format, media_format, filename_suffix, filename_suffix, filename_suffix)).fetchall()
 
 
 def find_existing_download(key, media_type):
     # yt-dlp's default completed filename ends with the video ID before the extension.
-    suffix = f" [{key}].{media_type}"
+    extensions = photo_types.values() if media_type == "image" else (f".{media_type}",)
     try:
-        rows = history_rows(media_format=media_type.upper(), filename_suffix=suffix)
+        rows = [
+            row for extension in extensions
+            for row in history_rows(media_format=extension[1:].upper(), filename_suffix=f" [{key}]{extension}")
+        ]
     except (OSError, sqlite3.Error) as error:
         print(f"Could not look up existing downloads: {error}", flush=True)
         return None
@@ -683,7 +690,7 @@ def recent_history(query, media_format):
 def history_context():
     query = request.args.get("history_query", "").strip()[:200]
     media_format = request.args.get("history_format", "").upper()
-    if media_format not in {"MP4", "MP3"}:
+    if media_format not in {"MP4", "MP3", "PHOTOS"}:
         media_format = ""
     return {
         "history": recent_history(query, media_format),
@@ -762,6 +769,8 @@ def video_format(quality):
 
 def download_options(platform, media_type, quality="best"):
     options = ["--playlist-items", "1"] if platform == "Instagram" else []
+    if media_type == "image":
+        return [*options, "--ignore-no-formats-error"]
     if media_type == "mp3":
         return [*options, "-x", "--audio-format", "mp3"]
     if platform == "Instagram":
@@ -850,7 +859,7 @@ def cancel_download(download_id):
         if job.cancelled:
             return "", 202
         try:
-            job.cancelled = stop_process_tree(job.process)
+            job.cancelled = job.process is None or stop_process_tree(job.process)
         except (OSError, subprocess.SubprocessError) as error:
             print(f"Could not cancel the download: {error}", flush=True)
             return "", 500
@@ -916,9 +925,17 @@ def lookup_preview(key, media_type, url):
                 video = next((entry for entry in (video.get("entries") or []) if isinstance(entry, dict)), None)
                 if video is None:
                     raise PreviewRequestError("No video was found in this Instagram post.")
-            preview = {"id": key, "title": video.get("title") or f"{platform} video", "duration": video_duration(video)}
+            fallback_title = "Instagram photo" if media_type == "image" else f"{platform} video"
+            preview = {"id": key, "title": video.get("title") or fallback_title, "duration": video_duration(video)}
             if platform == "Instagram":
                 preview["thumbnail"] = instagram_cdn_url(video.get("thumbnail"))
+            if media_type == "image":
+                if video.get("formats") or video.get("url"):
+                    raise PreviewRequestError("This post starts with a video. Choose MP4 to save the video.")
+                if not preview["thumbnail"]:
+                    raise PreviewRequestError("Instagram did not provide a photo for this post.")
+                if preview["title"].startswith("Video by "):
+                    preview["title"] = "Photo by " + preview["title"].removeprefix("Video by ")
         except subprocess.TimeoutExpired as error:
             raise PreviewRequestError("The size check timed out. Try again.") from error
         except subprocess.CalledProcessError as error:
@@ -931,6 +948,8 @@ def lookup_preview(key, media_type, url):
                 if http_status == 429:
                     pause_platform_requests(platform)
                 raise PreviewRequestError(message, http_status) from error
+            if platform == "Instagram" and media_type != "image" and "there is no video in this post" in output.lower():
+                raise PreviewRequestError("Choose Instagram photo and click Check size to save the photo.") from error
             raise PreviewRequestError(failure) from error
         except (OSError, ValueError) as error:
             raise PreviewRequestError(failure) from error
@@ -939,7 +958,10 @@ def lookup_preview(key, media_type, url):
             print(result.stderr, end="", file=sys.stderr, flush=True)
         comparisons = []
         message = ""
-        if media_type == "mp4" and platform == "YouTube":
+        if media_type == "image":
+            length = instagram_track_size({"url": preview["thumbnail"]}, photo=True)
+            sizes = {"best": size_message(format_mib(length) if length else None, False, media_type)}
+        elif media_type == "mp4" and platform == "YouTube":
             available = {"best": video}
             try:
                 available.update(compare_video_formats(result.stdout))
@@ -972,9 +994,112 @@ def lookup_preview(key, media_type, url):
         return data
 
 
+def download_event(state, message, **details):
+    return json.dumps({"state": state, "message": message, **details}) + "\n"
+
+
+def reserve_download(key):
+    with active_downloads_lock:
+        if key in active_video_ids:
+            return False
+        active_video_ids.add(key)
+        return True
+
+
+def photo_extension(prefix):
+    if prefix.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if prefix.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if prefix.startswith(b"RIFF") and prefix[8:12] == b"WEBP":
+        return ".webp"
+    raise ValueError("The server did not return a supported photo")
+
+
+def photo_download_events(source, download_id, cancel_url):
+    pause = platform_pause_message(source.platform)
+    if pause:
+        yield download_event("error", pause, http_status=429)
+        return
+    key = (source.platform, source.key)
+    if not reserve_download(key):
+        yield download_event("error", "This post is already downloading.", http_status=409)
+        return
+
+    job = ActiveDownload()
+    try:
+        with active_downloads_lock:
+            active_downloads[download_id] = job
+        yield download_event("starting", "Starting image download…", cancel_url=cancel_url)
+        preview, _, _, _ = lookup_preview(source.key, "image", source.url)
+        if job.cancelled:
+            yield download_event("cancelled", "Download cancelled.")
+            return
+        url = instagram_cdn_url(preview["thumbnail"])
+        if not url:
+            raise ValueError("No Instagram photo URL is available")
+
+        downloads.mkdir(exist_ok=True)
+        opener = build_opener(InstagramCDNRedirect())
+        request_headers = {"Accept-Encoding": "identity"}
+        with tempfile.TemporaryDirectory(dir=downloads) as folder:
+            partial = Path(folder) / "photo.part"
+            with opener.open(Request(url, headers=request_headers), timeout=10) as response, partial.open("wb") as stream:
+                prefix = response.read(12)
+                extension = photo_extension(prefix)
+                length = response.headers.get("Content-Length", "")
+                total = int(length) if re.fullmatch(r"[1-9][0-9]{0,18}", length) else None
+                stream.write(prefix)
+                received = len(prefix)
+                while not job.cancelled:
+                    data = response.read(128 * 1024)
+                    if not data:
+                        break
+                    stream.write(data)
+                    received += len(data)
+                    yield download_event("downloading", "Downloading image…", downloaded=received, total=total)
+            with active_downloads_lock:
+                active_downloads.pop(download_id, None)
+                if not job.cancelled:
+                    if total is not None and received != total:
+                        raise ValueError("The image transfer ended early")
+                    path = downloads / f"Instagram photo [instagram-{source.key}]{extension}"
+                    partial.replace(path)
+        if job.cancelled:
+            yield download_event("cancelled", "Download cancelled.")
+        else:
+            try:
+                record_download({"filepath": str(path), "title": preview["title"]})
+            except (OSError, sqlite3.Error, ValueError) as error:
+                print(f"Could not save download history: {error}", flush=True)
+                yield download_event("complete", f"{download_complete} History could not be saved.")
+            else:
+                yield download_event("complete", download_complete, history_saved=True)
+    except PreviewRequestError as error:
+        yield download_event("error", str(error), http_status=error.http_status)
+    except HTTPError as error:
+        error.close()
+        if job.cancelled:
+            yield download_event("cancelled", "Download cancelled.")
+        elif error.code == 429:
+            pause_platform_requests(source.platform)
+            yield download_event("error", "Instagram is rate-limiting requests. Try again later.", http_status=429)
+        else:
+            yield download_event("error", "Instagram could not serve the photo. Try checking the post again.")
+    except (OSError, ValueError) as error:
+        print(f"Photo download failed: {error}", flush=True)
+        if job.cancelled:
+            yield download_event("cancelled", "Download cancelled.")
+        else:
+            yield download_event("error", "Could not save the Instagram photo.")
+    finally:
+        with active_downloads_lock:
+            active_downloads.pop(download_id, None)
+            active_video_ids.remove(key)
+
+
 def download_events(command, url, download_id, cancel_url):
-    def event(state, message, **details):
-        return json.dumps({"state": state, "message": message, **details}) + "\n"
+    event = download_event
 
     source = video_source_from(url)
     platform = source.platform if source else "YouTube"
@@ -983,11 +1108,7 @@ def download_events(command, url, download_id, cancel_url):
         yield event("error", pause, http_status=429)
         return
     key = (platform, source.key) if source else url
-    with active_downloads_lock:
-        already_active = key in active_video_ids
-        if not already_active:
-            active_video_ids.add(key)
-    if already_active:
+    if not reserve_download(key):
         yield event("error", "This video is already downloading.", http_status=409)
         return
     finished_video = None
@@ -1089,7 +1210,9 @@ def download_events(command, url, download_id, cancel_url):
 def index():
     link = request.form.get("url", "").strip()
     quality = request.form.get("quality", "720")
-    media_type = "mp3" if request.form.get("format") == "mp3" else "mp4"
+    media_type = request.form.get("format", "mp4")
+    if media_type not in {"mp4", "mp3", "image"}:
+        media_type = "mp4"
     action = request.form.get("action")
     downloading = action == "download"
     if downloading and media_type == "mp4":
@@ -1108,7 +1231,9 @@ def index():
     if request.method == "POST":
         source = video_source_from(link)
         if not source:
-            message = "Paste a YouTube video or a public Instagram video post or Reel link."
+            message = "Paste a YouTube video link or a public Instagram post or Reel link."
+        elif media_type == "image" and not source.url.startswith("https://www.instagram.com/p/"):
+            message = "Choose Instagram photo with a public Instagram photo post link."
         else:
             is_instagram = source.platform == "Instagram"
             if is_instagram:
@@ -1122,7 +1247,10 @@ def index():
             if downloading and selection in request.form.getlist("checked"):
                 download_id = uuid4().hex
                 cancel_url = url_for("cancel_download", download_id=download_id)
-                events = download_events(command, source.url, download_id, cancel_url)
+                if media_type == "image":
+                    events = photo_download_events(source, download_id, cancel_url)
+                else:
+                    events = download_events(command, source.url, download_id, cancel_url)
                 if streaming:
                     return Response(
                         events, mimetype=progress_type,
