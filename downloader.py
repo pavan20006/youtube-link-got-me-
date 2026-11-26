@@ -107,7 +107,20 @@ page = r"""
   .photo-grid span { display: block; margin-top: 0.25rem; }
   .photo-grid label { display: block; padding: 0.25rem; border-radius: 0.25rem; cursor: pointer; }
   .photo-grid label:has(:checked) { outline: 2px solid #1647a6; background: #eaf0ff; }
+  .photo-grid button { margin: 0.375rem 0.25rem 0; }
   .photo-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.75rem; }
+  #photo-preview-dialog {
+    box-sizing: border-box;
+    width: min(60rem, calc(100% - 2rem));
+    max-height: calc(100% - 2rem);
+    padding: 1rem;
+    border: 1px solid #b8bdc6;
+    border-radius: 0.5rem;
+  }
+  #photo-preview-dialog::backdrop { background: rgb(0 0 0 / 65%); }
+  .photo-dialog-header { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+  .photo-dialog-header h2 { margin: 0; }
+  #enlarged-photo { display: block; width: 100%; height: 68vh; object-fit: contain; margin: 0.75rem 0; background: #edf0f4; }
   .quality-comparison { margin: 0 0 1rem; min-width: 0; max-width: 37.5rem; }
   .quality-comparison table { width: 100%; border-collapse: collapse; }
   .quality-comparison th, .quality-comparison td { text-align: left; padding: 0.5rem 0.375rem; border-bottom: 1px solid #b8bdc6; }
@@ -169,6 +182,7 @@ page = r"""
                 <img src="{{ photo.url }}" alt="" width="160" height="160" loading="lazy" referrerpolicy="no-referrer">
                 <span><input type="checkbox" name="photo_position" value="{{ photo.position }}"> Slide {{ photo.position }}</span>
               </label>
+              <button type="button" data-enlarge-photo aria-label="Enlarge slide {{ photo.position }}" hidden>Enlarge</button>
             </li>
             {% endfor %}
           </ul>
@@ -212,6 +226,16 @@ page = r"""
   {% endif %}
   </div>
 </form>
+<dialog id="photo-preview-dialog" aria-labelledby="enlarged-photo-title">
+  <div class="photo-dialog-header">
+    <h2 id="enlarged-photo-title"></h2>
+    <form method="dialog">
+      <button autofocus>Close</button>
+    </form>
+  </div>
+  <img id="enlarged-photo" alt="Enlarged photo" referrerpolicy="no-referrer">
+  <label><input type="checkbox" id="enlarged-photo-selection"> Select this photo</label>
+</dialog>
 <div id="existing-result">
 {% if existing %}
   <section id="existing-video" aria-labelledby="existing-title">
@@ -275,6 +299,11 @@ page = r"""
   const form = document.querySelector('#download-form');
   const checkStatus = document.querySelector('#download-status');
   const checkedResult = document.querySelector('#checked-result');
+  const photoDialog = document.querySelector('#photo-preview-dialog');
+  const enlargedPhotoTitle = document.querySelector('#enlarged-photo-title');
+  const enlargedPhoto = document.querySelector('#enlarged-photo');
+  const enlargedPhotoSelection = document.querySelector('#enlarged-photo-selection');
+  let enlargedPhotoInput;
   const existingResult = document.querySelector('#existing-result');
   const jobs = document.querySelector('#download-jobs');
   const jobList = document.querySelector('#download-job-list');
@@ -344,15 +373,37 @@ page = r"""
     feedback.hidden = false;
     feedback.textContent = `${count} of ${inputs.length} selected`;
     checkedResult.querySelectorAll('button[data-photo-selection]').forEach(button => { button.hidden = false; });
+    if (typeof photoDialog.showModal === 'function') {
+      checkedResult.querySelectorAll('button[data-enlarge-photo]').forEach(button => { button.hidden = false; });
+    }
   }
 
   checkedResult.addEventListener('click', event => {
+    const enlargeButton = event.target.closest('button[data-enlarge-photo]');
+    if (enlargeButton) {
+      const tile = enlargeButton.closest('li');
+      enlargedPhotoInput = tile.querySelector('input[name="photo_position"]');
+      enlargedPhotoTitle.textContent = `Slide ${enlargedPhotoInput.value}`;
+      enlargedPhoto.src = tile.querySelector('img').src;
+      enlargedPhotoSelection.checked = enlargedPhotoInput.checked;
+      photoDialog.showModal();
+      return;
+    }
     const button = event.target.closest('button[data-photo-selection]');
     if (!button) return;
     checkedResult.querySelectorAll('input[name="photo_position"]').forEach(input => {
       input.checked = button.dataset.photoSelection === 'all';
     });
     updatePhotoSelection();
+  });
+
+  enlargedPhotoSelection.addEventListener('input', () => {
+    enlargedPhotoInput.checked = enlargedPhotoSelection.checked;
+    updatePhotoSelection();
+  });
+  photoDialog.addEventListener('close', () => {
+    enlargedPhoto.removeAttribute('src');
+    enlargedPhotoInput = undefined;
   });
 
   updatePhotoSelection();
