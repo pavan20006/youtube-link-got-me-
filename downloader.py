@@ -13,7 +13,9 @@ from math import ceil
 from pathlib import Path
 from threading import Lock
 from time import monotonic
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import uuid4
 
 from flask import Flask, Response, render_template, render_template_string, request, url_for
@@ -524,16 +526,67 @@ def video_source_from(link):
     return None
 
 
-def instagram_thumbnail(value):
+def instagram_cdn_url(value):
     if not isinstance(value, str):
         return None
     try:
         parts = urlsplit(value)
+        port = parts.port
     except ValueError:
         return None
     host = parts.hostname or ""
-    if parts.scheme == "https" and parts.username is None and host.endswith((".cdninstagram.com", ".fbcdn.net")):
+    if (
+        parts.scheme == "https" and parts.username is None and port in (None, 443)
+        and host.endswith((".cdninstagram.com", ".fbcdn.net"))
+    ):
         return value
+    return None
+
+
+class InstagramCDNRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not instagram_cdn_url(newurl):
+            return None
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None:
+            redirected.method = req.get_method()
+        return redirected
+
+
+def instagram_track_size(track):
+    url = instagram_cdn_url(track.get("url"))
+    if not url or track.get("fragments") or track.get("protocol") not in (None, "http", "https"):
+        return None
+
+    media_headers = track.get("http_headers") or {}
+    headers = {name: value for name, value in media_headers.items() if name.lower() in {"user-agent", "referer"}}
+    headers["Accept-Encoding"] = "identity"
+    opener = build_opener(InstagramCDNRedirect())
+    for method in ("HEAD", "GET"):
+        request_headers = {**headers, "Range": "bytes=0-0"} if method == "GET" else headers
+        try:
+            with opener.open(Request(url, headers=request_headers, method=method), timeout=3) as response:
+                media_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                encoding = response.headers.get("Content-Encoding", "identity").strip().lower()
+                if encoding != "identity" or (
+                    media_type and not media_type.startswith(("video/", "audio/"))
+                    and media_type not in {"application/octet-stream", "binary/octet-stream"}
+                ):
+                    continue
+                if response.status == 206:
+                    match = re.fullmatch(r"bytes 0-0/([1-9][0-9]{0,18})", response.headers.get("Content-Range", ""))
+                    if match:
+                        return int(match.group(1))
+                elif response.status == 200:
+                    length = response.headers.get("Content-Length", "")
+                    if re.fullmatch(r"[1-9][0-9]{0,18}", length):
+                        return int(length)
+        except HTTPError as error:
+            error.close()
+            if error.code == 429:
+                return None
+        except OSError:
+            continue
     return None
 
 
@@ -865,7 +918,7 @@ def lookup_preview(key, media_type, url):
                     raise PreviewRequestError("No video was found in this Instagram post.")
             preview = {"id": key, "title": video.get("title") or f"{platform} video", "duration": video_duration(video)}
             if platform == "Instagram":
-                preview["thumbnail"] = instagram_thumbnail(video.get("thumbnail"))
+                preview["thumbnail"] = instagram_cdn_url(video.get("thumbnail"))
         except subprocess.TimeoutExpired as error:
             raise PreviewRequestError("The size check timed out. Try again.") from error
         except subprocess.CalledProcessError as error:
@@ -902,6 +955,13 @@ def lookup_preview(key, media_type, url):
                 sizes = {"best": comparison_row("best", video, video.get("duration"))["message"]}
         else:
             amount, approximate = media_size(video, media_type)
+            if amount is None and platform == "Instagram" and media_type == "mp4":
+                for track in video.get("requested_formats") or [video]:
+                    if not track.get("filesize") and not track.get("filesize_approx"):
+                        length = instagram_track_size(track)
+                        if length:
+                            track["filesize"] = length
+                amount, approximate = media_size(video, media_type)
             sizes = {"best": size_message(amount, approximate, media_type)}
 
         data = (preview, sizes, comparisons, message)
