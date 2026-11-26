@@ -10,6 +10,7 @@ from collections import OrderedDict
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from http.client import HTTPException
 from math import ceil
 from pathlib import Path
 from threading import Lock
@@ -101,6 +102,9 @@ page = r"""
   .video-preview div { flex: 1 1 12rem; min-width: 0; overflow-wrap: anywhere; }
   .video-preview h2 { font-size: 1.125rem; margin: 0; }
   .video-preview p { margin: 0.375rem 0 0; }
+  .photo-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr)); gap: 0.75rem; padding: 0; list-style: none; }
+  .photo-grid img { display: block; width: 100%; aspect-ratio: 1; object-fit: contain; background: #edf0f4; }
+  .photo-grid span { display: block; margin-top: 0.25rem; }
   .quality-comparison { margin: 0 0 1rem; min-width: 0; max-width: 37.5rem; }
   .quality-comparison table { width: 100%; border-collapse: collapse; }
   .quality-comparison th, .quality-comparison td { text-align: left; padding: 0.5rem 0.375rem; border-bottom: 1px solid #b8bdc6; }
@@ -137,7 +141,7 @@ page = r"""
   {% if checked %}
     <div id="checked-video">
       <article class="video-preview" aria-labelledby="video-title">
-        {% if is_instagram and preview.thumbnail %}
+        {% if is_instagram and preview.thumbnail and preview.photos | length <= 1 %}
         <img src="{{ preview.thumbnail }}" alt="" width="192" height="144" referrerpolicy="no-referrer">
         {% elif not is_instagram %}
         <img src="https://i.ytimg.com/vi/{{ preview.id }}/hqdefault.jpg" alt=""
@@ -146,7 +150,19 @@ page = r"""
         <div>
           <h2 id="video-title">{{ preview.title }}</h2>
           {% if media_type != 'image' %}<p>Duration: {{ preview.duration }}</p>{% endif %}
+          {% if preview.photos | length > 1 %}
+          <p>{{ preview.photos | length }} photos</p>
+          <ul class="photo-grid">
+            {% for photo in preview.photos %}
+            <li>
+              <img src="{{ photo.url }}" alt="" width="160" height="160" loading="lazy" referrerpolicy="no-referrer">
+              <span>Slide {{ photo.position }}</span>
+            </li>
+            {% endfor %}
+          </ul>
+          {% else %}
           <p id="preview-size" role="status">{{ size }}</p>
+          {% endif %}
         </div>
       </article>
       {% if comparisons %}
@@ -177,7 +193,7 @@ page = r"""
       {% for selection in checked %}
         <input type="hidden" name="checked" value="{{ selection }}">
       {% endfor %}
-      <button type="submit" name="action" value="download">{{ 'Download image' if media_type == 'image' else 'Download' }}</button>
+      <button type="submit" name="action" value="download">{{ 'Download all photos' if preview.photos | length > 1 else 'Download image' if media_type == 'image' else 'Download' }}</button>
     </div>
   {% endif %}
   </div>
@@ -355,10 +371,15 @@ page = r"""
     if (status.textContent !== event.message) status.textContent = event.message;
     if (event.state === 'complete') {
       bar.value = 100;
-      details.textContent = '100%';
+      details.textContent = event.photo_count ? `${event.photo_count} photos saved` : '100%';
       return;
     }
     if (event.state === 'error' || event.state === 'cancelled') progress.hidden = true;
+    if (event.photo_count) {
+      bar.value = event.photos_saved / event.photo_count * 100;
+      details.textContent = `${event.photos_saved} of ${event.photo_count} photos saved`;
+      return;
+    }
 
     const {downloaded, total, estimated, eta, speed} = event;
     const parts = [];
@@ -770,7 +791,7 @@ def video_format(quality):
 def download_options(platform, media_type, quality="best"):
     options = ["--playlist-items", "1"] if platform == "Instagram" else []
     if media_type == "image":
-        return [*options, "--ignore-no-formats-error"]
+        return ["--ignore-no-formats-error"]
     if media_type == "mp3":
         return [*options, "-x", "--audio-format", "mp3"]
     if platform == "Instagram":
@@ -898,6 +919,20 @@ class PreviewRequestError(Exception):
         self.http_status = http_status
 
 
+def instagram_photos(video, key):
+    entries = (video.get("entries") or []) if video.get("_type") == "playlist" else [video]
+    photos = []
+    for index, entry in enumerate(entries, 1):
+        if not isinstance(entry, dict) or entry.get("formats") or entry.get("url") or entry.get("duration"):
+            continue
+        thumbnail = instagram_cdn_url(entry.get("thumbnail"))
+        if thumbnail:
+            position = entry.get("playlist_index") or index
+            suffix = "" if position == 1 else f"-{position:02d}"
+            photos.append({"position": position, "url": thumbnail, "key": f"instagram-{key}{suffix}"})
+    return photos
+
+
 def lookup_preview(key, media_type, url):
     source = video_source_from(url)
     platform = source.platform if source else "YouTube"
@@ -921,7 +956,7 @@ def lookup_preview(key, media_type, url):
                 encoding="utf-8", errors="replace", timeout=30,
             )
             video = json.loads(result.stdout)
-            if platform == "Instagram" and video.get("_type") == "playlist":
+            if platform == "Instagram" and media_type != "image" and video.get("_type") == "playlist":
                 video = next((entry for entry in (video.get("entries") or []) if isinstance(entry, dict)), None)
                 if video is None:
                     raise PreviewRequestError("No video was found in this Instagram post.")
@@ -930,10 +965,11 @@ def lookup_preview(key, media_type, url):
             if platform == "Instagram":
                 preview["thumbnail"] = instagram_cdn_url(video.get("thumbnail"))
             if media_type == "image":
-                if video.get("formats") or video.get("url"):
-                    raise PreviewRequestError("This post starts with a video. Choose MP4 to save the video.")
-                if not preview["thumbnail"]:
-                    raise PreviewRequestError("Instagram did not provide a photo for this post.")
+                photos = instagram_photos(video, key)
+                if not photos:
+                    raise PreviewRequestError("No downloadable photos were found in this Instagram post.")
+                preview["photos"] = photos
+                preview["thumbnail"] = photos[0]["url"]
                 if preview["title"].startswith("Video by "):
                     preview["title"] = "Photo by " + preview["title"].removeprefix("Video by ")
         except subprocess.TimeoutExpired as error:
@@ -959,7 +995,7 @@ def lookup_preview(key, media_type, url):
         comparisons = []
         message = ""
         if media_type == "image":
-            length = instagram_track_size({"url": preview["thumbnail"]}, photo=True)
+            length = instagram_track_size({"url": photos[0]["url"]}, photo=True) if len(photos) == 1 else None
             sizes = {"best": size_message(format_mib(length) if length else None, False, media_type)}
         elif media_type == "mp4" and platform == "YouTube":
             available = {"best": video}
@@ -1016,6 +1052,38 @@ def photo_extension(prefix):
     raise ValueError("The server did not return a supported photo")
 
 
+def save_photo(photo, opener, job, show_bytes):
+    url = instagram_cdn_url(photo["url"])
+    if not url:
+        raise ValueError("No Instagram photo URL is available")
+    with tempfile.TemporaryDirectory(dir=downloads) as folder:
+        partial = Path(folder) / "photo.part"
+        request = Request(url, headers={"Accept-Encoding": "identity"})
+        with opener.open(request, timeout=10) as response, partial.open("wb") as stream:
+            prefix = response.read(12)
+            extension = photo_extension(prefix)
+            length = response.headers.get("Content-Length", "")
+            total = int(length) if re.fullmatch(r"[1-9][0-9]{0,18}", length) else None
+            stream.write(prefix)
+            received = len(prefix)
+            while not job.cancelled:
+                data = response.read(128 * 1024)
+                if not data:
+                    break
+                stream.write(data)
+                received += len(data)
+                if show_bytes:
+                    yield download_event("downloading", "Downloading image…", downloaded=received, total=total)
+        with active_downloads_lock:
+            if job.cancelled:
+                return None
+            if total is not None and received != total:
+                raise ValueError("The image transfer ended early")
+            path = downloads / f"Instagram photo [{photo['key']}]{extension}"
+            partial.replace(path)
+    return path
+
+
 def photo_download_events(source, download_id, cancel_url):
     pause = platform_pause_message(source.platform)
     if pause:
@@ -1030,62 +1098,71 @@ def photo_download_events(source, download_id, cancel_url):
     try:
         with active_downloads_lock:
             active_downloads[download_id] = job
-        yield download_event("starting", "Starting image download…", cancel_url=cancel_url)
+        yield download_event("starting", "Starting photo download…", cancel_url=cancel_url)
         preview, _, _, _ = lookup_preview(source.key, "image", source.url)
-        if job.cancelled:
-            yield download_event("cancelled", "Download cancelled.")
-            return
-        url = instagram_cdn_url(preview["thumbnail"])
-        if not url:
-            raise ValueError("No Instagram photo URL is available")
-
+        photos = preview["photos"]
+        count = len(photos)
+        saved = 0
+        history_saved = False
+        history_error = False
+        rate_limited = False
         downloads.mkdir(exist_ok=True)
         opener = build_opener(InstagramCDNRedirect())
-        request_headers = {"Accept-Encoding": "identity"}
-        with tempfile.TemporaryDirectory(dir=downloads) as folder:
-            partial = Path(folder) / "photo.part"
-            with opener.open(Request(url, headers=request_headers), timeout=10) as response, partial.open("wb") as stream:
-                prefix = response.read(12)
-                extension = photo_extension(prefix)
-                length = response.headers.get("Content-Length", "")
-                total = int(length) if re.fullmatch(r"[1-9][0-9]{0,18}", length) else None
-                stream.write(prefix)
-                received = len(prefix)
-                while not job.cancelled:
-                    data = response.read(128 * 1024)
-                    if not data:
-                        break
-                    stream.write(data)
-                    received += len(data)
-                    yield download_event("downloading", "Downloading image…", downloaded=received, total=total)
-            with active_downloads_lock:
-                active_downloads.pop(download_id, None)
-                if not job.cancelled:
-                    if total is not None and received != total:
-                        raise ValueError("The image transfer ended early")
-                    path = downloads / f"Instagram photo [instagram-{source.key}]{extension}"
-                    partial.replace(path)
-        if job.cancelled:
-            yield download_event("cancelled", "Download cancelled.")
-        else:
+        for photo in photos:
+            if job.cancelled:
+                break
+            if count > 1:
+                yield download_event("downloading", f"Saving photo from slide {photo['position']}…", photos_saved=saved, photo_count=count)
+            if find_existing_download(photo["key"], "image"):
+                saved += 1
+                continue
             try:
-                record_download({"filepath": str(path), "title": preview["title"]})
+                path = yield from save_photo(photo, opener, job, show_bytes=count == 1)
+            except HTTPError as error:
+                error.close()
+                if error.code == 429:
+                    pause_platform_requests(source.platform)
+                    rate_limited = True
+                    break
+                print(f"Instagram photo from slide {photo['position']} failed: HTTP {error.code}", flush=True)
+                continue
+            except (OSError, ValueError, HTTPException) as error:
+                print(f"Could not save Instagram photo from slide {photo['position']}: {error}", flush=True)
+                continue
+            if path is None:
+                break
+
+            saved += 1
+            title = f"{preview['title']} · Slide {photo['position']}" if count > 1 else preview["title"]
+            try:
+                record_download({"filepath": str(path), "title": title})
             except (OSError, sqlite3.Error, ValueError) as error:
                 print(f"Could not save download history: {error}", flush=True)
-                yield download_event("complete", f"{download_complete} History could not be saved.")
+                history_error = True
             else:
-                yield download_event("complete", download_complete, history_saved=True)
+                history_saved = True
+
+        with active_downloads_lock:
+            active_downloads.pop(download_id, None)
+        summary = f"Saved {saved} of {count} photos."
+        if job.cancelled:
+            message = f"Download cancelled. {summary}" if count > 1 else "Download cancelled."
+            yield download_event("cancelled", message, history_saved=history_saved)
+        elif rate_limited:
+            message = "Instagram is rate-limiting requests. Try again later."
+            if count > 1:
+                message = f"{summary} {message}"
+            yield download_event("error", message, http_status=429, history_saved=history_saved)
+        elif saved < count:
+            message = f"{summary} Try again for the remaining photos." if count > 1 else "Could not save the Instagram photo."
+            yield download_event("error", message, history_saved=history_saved)
+        else:
+            message = f"{summary} Open your Downloads folder." if count > 1 else download_complete
+            if history_error:
+                message += " Some download history could not be saved."
+            yield download_event("complete", message, history_saved=history_saved, photo_count=count if count > 1 else None)
     except PreviewRequestError as error:
         yield download_event("error", str(error), http_status=error.http_status)
-    except HTTPError as error:
-        error.close()
-        if job.cancelled:
-            yield download_event("cancelled", "Download cancelled.")
-        elif error.code == 429:
-            pause_platform_requests(source.platform)
-            yield download_event("error", "Instagram is rate-limiting requests. Try again later.", http_status=429)
-        else:
-            yield download_event("error", "Instagram could not serve the photo. Try checking the post again.")
     except (OSError, ValueError) as error:
         print(f"Photo download failed: {error}", flush=True)
         if job.cancelled:
@@ -1264,7 +1341,7 @@ def index():
                 if streaming:
                     return {"message": "Check the size for these settings before downloading."}, 400
                 existing = find_existing_download(history_key, media_type)
-                if not existing or action == "check-online":
+                if media_type == "image" or not existing or action == "check-online":
                     try:
                         preview, sizes, comparisons, message = lookup_preview(source.key, media_type, source.url)
                     except PreviewRequestError as error:
@@ -1280,6 +1357,11 @@ def index():
                         else:
                             size = sizes["best"]
                             checked = [selection]
+                            if media_type == "image":
+                                photos = preview["photos"]
+                                existing = find_existing_download(photos[0]["key"], "image") if len(photos) == 1 else None
+                                if existing and action != "check-online":
+                                    checked = []
     if streaming:
         return {"message": message or "Check the size for these settings before downloading."}, 400
     return render_template_string(
