@@ -11,12 +11,12 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.client import HTTPException
-from math import ceil
+from math import ceil, pi
 from pathlib import Path
 from threading import Lock
 from time import monotonic
 from urllib.error import HTTPError
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import uuid4
 
@@ -39,6 +39,7 @@ finished_file_prefix = "DOWNLOADER_FILE "
 download_complete = "Download complete. Open your Downloads folder."
 download_failed = "Download failed. Check the PowerShell window."
 photo_types = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
+twitter_photo_headers = {"User-Agent": "Mozilla/5.0", "Accept": "image/*"}
 
 
 @dataclass
@@ -138,10 +139,10 @@ page = r"""
 </style>
 <h1>My Video Downloader</h1>
 <form id="download-form" method="post" action="{{ url_for('index') }}">
-  <label for="url">YouTube or Instagram link</label>
+  <label for="url">YouTube, Instagram, or Twitter/X link</label>
   <input id="url" name="url" type="url" value="{{ link }}" required>
   <label for="quality">Video quality</label>
-  <select id="quality" name="quality" {% if is_instagram %}disabled{% endif %}>
+  <select id="quality" name="quality" {% if best_only %}disabled{% endif %}>
     {% for value, label in qualities.items() %}
       <option value="{{ value }}" {% if value == quality %}selected{% endif %}>{{ label }}</option>
     {% endfor %}
@@ -150,16 +151,16 @@ page = r"""
   <select id="format" name="format">
     <option value="mp4">MP4 video with sound</option>
     <option value="mp3" {% if media_type == 'mp3' %}selected{% endif %}>MP3 audio only</option>
-    <option value="image" {% if media_type == 'image' %}selected{% endif %}>Instagram photo</option>
+    <option value="image" {% if media_type == 'image' %}selected{% endif %}>Photo (Instagram or X)</option>
   </select>
   <button type="submit" name="action" value="check">Check size</button>
   <div id="checked-result">
   {% if checked %}
     <div id="checked-video">
       <article class="video-preview" aria-labelledby="video-title">
-        {% if is_instagram and preview.thumbnail and preview.photos | length <= 1 %}
+        {% if preview.thumbnail and preview.photos | length <= 1 %}
         <img src="{{ preview.thumbnail }}" alt="" width="192" height="144" referrerpolicy="no-referrer">
-        {% elif not is_instagram %}
+        {% elif not best_only %}
         <img src="https://i.ytimg.com/vi/{{ preview.id }}/hqdefault.jpg" alt=""
              width="192" height="144" referrerpolicy="no-referrer">
         {% endif %}
@@ -625,6 +626,7 @@ class VideoSource:
     platform: str
     key: str
     url: str
+    video_position: str = ""
 
 
 def video_source_from(link):
@@ -645,6 +647,21 @@ def video_source_from(link):
         if kind == "reels":
             kind = "reel"
         return VideoSource("Instagram", key, f"https://www.instagram.com/{kind}/{key}/")
+    if parts.hostname in {
+        "x.com", "www.x.com", "m.x.com", "mobile.x.com",
+        "twitter.com", "www.twitter.com", "m.twitter.com", "mobile.twitter.com",
+    }:
+        post = re.fullmatch(
+            r"/(?:i/web|[A-Za-z0-9_]{1,15})/status/([1-9][0-9]{0,19})(?:/(photo|video)/([1-9][0-9]{0,2}))?/?",
+            parts.path,
+        )
+        if post and parts.netloc.lower() in {parts.hostname, f"{parts.hostname}:443"}:
+            key, kind, position = post.groups()
+            url = f"https://x.com/i/web/status/{key}"
+            if kind == "video":
+                return VideoSource("Twitter/X", key, f"{url}/video/{position}", position)
+            return VideoSource("Twitter/X", key, url)
+        return None
     key = video_id(link)
     if re.fullmatch(r"[A-Za-z0-9_-]{11}", key):
         return VideoSource("YouTube", key, f"https://www.youtube.com/watch?v={key}")
@@ -668,9 +685,28 @@ def instagram_cdn_url(value):
     return None
 
 
-class InstagramCDNRedirect(HTTPRedirectHandler):
+def media_cdn_url(platform, value):
+    if platform == "Instagram":
+        return instagram_cdn_url(value)
+    if platform != "Twitter/X" or not isinstance(value, str):
+        return None
+    try:
+        parts = urlsplit(value)
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme == "https" and parts.username is None and port in (None, 443):
+        if parts.hostname == "pbs.twimg.com" or parts.hostname == "video.twimg.com":
+            return value
+    return None
+
+
+class MediaCDNRedirect(HTTPRedirectHandler):
+    def __init__(self, platform):
+        self.platform = platform
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if not instagram_cdn_url(newurl):
+        if not media_cdn_url(self.platform, newurl):
             return None
         redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
         if redirected is not None:
@@ -678,15 +714,17 @@ class InstagramCDNRedirect(HTTPRedirectHandler):
         return redirected
 
 
-def instagram_track_size(track, *, photo=False):
-    url = instagram_cdn_url(track.get("url"))
+def media_track_size(platform, track, *, photo=False):
+    url = media_cdn_url(platform, track.get("url"))
     if not url or track.get("fragments") or track.get("protocol") not in (None, "http", "https"):
         return None
 
     media_headers = track.get("http_headers") or {}
     headers = {name: value for name, value in media_headers.items() if name.lower() in {"user-agent", "referer"}}
+    if photo and platform == "Twitter/X":
+        headers.update(twitter_photo_headers)
     headers["Accept-Encoding"] = "identity"
-    opener = build_opener(InstagramCDNRedirect())
+    opener = build_opener(MediaCDNRedirect(platform))
     for method in ("HEAD", "GET"):
         request_headers = {**headers, "Range": "bytes=0-0"} if method == "GET" else headers
         try:
@@ -889,14 +927,16 @@ def video_format(quality):
 
 
 def download_options(platform, media_type, quality="best"):
-    options = ["--playlist-items", "1"] if platform == "Instagram" else []
     if media_type == "image":
         return ["--ignore-no-formats-error"]
+    options = ["--playlist-items", "1"] if platform != "YouTube" else []
+    if platform == "Twitter/X":
+        options += ["--ies", "twitter,twitter:amplify,twitter:card"]
     if media_type == "mp3":
         return [*options, "-x", "--audio-format", "mp3"]
     if platform == "Instagram":
         return [*options, "-f", "b[ext=mp4]/bv[ext=mp4]+ba[ext=m4a]", "--merge-output-format", "mp4"]
-    options = ["-t", "mp4"]
+    options += ["-t", "mp4"]
     if quality != "best":
         options += ["-f", video_format(quality)]
     return options
@@ -997,6 +1037,11 @@ def platform_restriction(output, platform):
         return 403, "Instagram requires sign-in for this video. Try a public post or Reel."
     if platform == "YouTube" and "sign in to confirm" in output and "not a bot" in output:
         return 403, "YouTube is asking for verification. Open the video on YouTube to check whether it plays."
+    if platform == "Twitter/X" and any(reason in output for reason in (
+        "login required", "only available to registered", "protected tweets", "not authorized",
+        "this tweet is unavailable",
+    )):
+        return 403, "Twitter/X did not make this post available. Try a public post that opens without signing in."
     return None
 
 
@@ -1033,10 +1078,59 @@ def instagram_photos(video, key):
     return photos
 
 
+def twitter_photo_preview(key):
+    try:
+        from yt_dlp.jsinterp import js_number_to_string
+    except ImportError as error:
+        raise PreviewRequestError(
+            'Twitter/X photos require the yt-dlp Python package. In PowerShell, run py -m pip install -U "yt-dlp[default]".'
+        ) from error
+
+    # X's public embed endpoint uses a token calculated from the post ID.
+    token = js_number_to_string((int(key) / 1e15) * pi, 36).replace(".", "").replace("0", "")
+    query = urlencode({"id": key, "token": token, "lang": "en"})
+    opener = build_opener(MediaCDNRedirect("Twitter/X"))
+    try:
+        with opener.open(f"https://cdn.syndication.twimg.com/tweet-result?{query}", timeout=10) as response:
+            post = json.loads(response.read(2 * 1024 * 1024))
+    except HTTPError as error:
+        error.close()
+        if error.code == 429:
+            pause_platform_requests("Twitter/X")
+            raise PreviewRequestError("Twitter/X is rate-limiting requests. Wait a while before trying again.", 429) from error
+        if error.code in {401, 403, 404}:
+            raise PreviewRequestError("Twitter/X did not make this post available to public previews.", error.code) from error
+        raise
+
+    if not isinstance(post, dict) or not post or post.get("tombstone"):
+        raise PreviewRequestError("Twitter/X did not make this post available to public previews.")
+    photos = []
+    media_details = post.get("mediaDetails")
+    if not isinstance(media_details, list):
+        media_details = []
+    for position, media in enumerate(media_details, 1):
+        if not isinstance(media, dict) or media.get("type") != "photo":
+            continue
+        url = media_cdn_url("Twitter/X", media.get("media_url_https"))
+        if not url:
+            continue
+        parts = urlsplit(url)
+        if parts.hostname != "pbs.twimg.com" or not parts.path.startswith("/media/"):
+            continue
+        suffix = "" if position == 1 else f"-{position:02d}"
+        photos.append({"position": position, "url": url, "key": f"twitter-{key}{suffix}"})
+    if not photos:
+        raise PreviewRequestError("No photos were found in this Twitter/X post. For a video, choose MP4 video with sound.")
+    user = post.get("user")
+    author = user.get("screen_name") if isinstance(user, dict) else None
+    title = f"Post by @{author}" if author else "Twitter/X post"
+    return {"id": key, "title": title, "photos": photos, "thumbnail": photos[0]["url"]}
+
+
 def lookup_preview(key, media_type, url):
     source = video_source_from(url)
     platform = source.platform if source else "YouTube"
-    cache_key = (platform, key, media_type)
+    cache_key = (platform, key, media_type, source.video_position if source and media_type != "image" else "")
     with preview_cache_lock:
         # Serialize metadata lookups so simultaneous checks can share the same result.
         cached = preview_cache.get(cache_key)
@@ -1047,31 +1141,35 @@ def lookup_preview(key, media_type, url):
         if pause:
             raise PreviewRequestError(pause, 429)
 
-        options = download_options(platform, media_type)
+        result = None
         failure = "Could not check the size. Check the PowerShell window."
         try:
-            result = subprocess.run(
-                [*yt_dlp_command, *options, "--skip-download", "--dump-single-json", "--", url],
-                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                encoding="utf-8", errors="replace", timeout=30,
-            )
-            video = json.loads(result.stdout)
-            if platform == "Instagram" and media_type != "image" and video.get("_type") == "playlist":
-                video = next((entry for entry in (video.get("entries") or []) if isinstance(entry, dict)), None)
-                if video is None:
-                    raise PreviewRequestError("No video was found in this Instagram post.")
-            fallback_title = "Instagram photo" if media_type == "image" else f"{platform} video"
-            preview = {"id": key, "title": video.get("title") or fallback_title, "duration": video_duration(video)}
-            if platform == "Instagram":
-                preview["thumbnail"] = instagram_cdn_url(video.get("thumbnail"))
-            if media_type == "image":
-                photos = instagram_photos(video, key)
-                if not photos:
-                    raise PreviewRequestError("No downloadable photos were found in this Instagram post.")
-                preview["photos"] = photos
-                preview["thumbnail"] = photos[0]["url"]
-                if preview["title"].startswith("Video by "):
-                    preview["title"] = "Photo by " + preview["title"].removeprefix("Video by ")
+            if platform == "Twitter/X" and media_type == "image":
+                preview = twitter_photo_preview(key)
+            else:
+                options = download_options(platform, media_type)
+                result = subprocess.run(
+                    [*yt_dlp_command, *options, "--skip-download", "--dump-single-json", "--", url],
+                    check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    encoding="utf-8", errors="replace", timeout=30,
+                )
+                video = json.loads(result.stdout)
+                if platform != "YouTube" and media_type != "image" and video.get("_type") == "playlist":
+                    video = next((entry for entry in (video.get("entries") or []) if isinstance(entry, dict)), None)
+                    if video is None:
+                        raise PreviewRequestError(f"No video was found in this {platform} post.")
+                fallback_title = "Instagram photo" if media_type == "image" else f"{platform} video"
+                preview = {"id": key, "title": video.get("title") or fallback_title, "duration": video_duration(video)}
+                if platform != "YouTube":
+                    preview["thumbnail"] = media_cdn_url(platform, video.get("thumbnail"))
+                if media_type == "image":
+                    photos = instagram_photos(video, key)
+                    if not photos:
+                        raise PreviewRequestError("No downloadable photos were found in this Instagram post.")
+                    preview["photos"] = photos
+                    preview["thumbnail"] = photos[0]["url"]
+                    if preview["title"].startswith("Video by "):
+                        preview["title"] = "Photo by " + preview["title"].removeprefix("Video by ")
         except subprocess.TimeoutExpired as error:
             raise PreviewRequestError("The size check timed out. Try again.") from error
         except subprocess.CalledProcessError as error:
@@ -1085,17 +1183,22 @@ def lookup_preview(key, media_type, url):
                     pause_platform_requests(platform)
                 raise PreviewRequestError(message, http_status) from error
             if platform == "Instagram" and media_type != "image" and "there is no video in this post" in output.lower():
-                raise PreviewRequestError("Choose Instagram photo and click Check size to save the photo.") from error
+                raise PreviewRequestError("Choose Photo (Instagram or X) and click Check size to see the photo.") from error
+            if platform == "Twitter/X" and any(reason in output.lower() for reason in (
+                "no video could be found", "no suitable extractor", "is not a video",
+            )):
+                raise PreviewRequestError("No supported video was found in this Twitter/X post. For photos, choose Photo (Instagram or X).") from error
             raise PreviewRequestError(failure) from error
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, HTTPException) as error:
             raise PreviewRequestError(failure) from error
 
-        if result.stderr:
+        if result and result.stderr:
             print(result.stderr, end="", file=sys.stderr, flush=True)
         comparisons = []
         message = ""
         if media_type == "image":
-            length = instagram_track_size({"url": photos[0]["url"]}, photo=True) if len(photos) == 1 else None
+            photos = preview["photos"]
+            length = media_track_size(platform, photos[0], photo=True) if len(photos) == 1 else None
             sizes = {"best": size_message(format_mib(length) if length else None, False, media_type)}
         elif media_type == "mp4" and platform == "YouTube":
             available = {"best": video}
@@ -1113,10 +1216,10 @@ def lookup_preview(key, media_type, url):
                 sizes = {"best": comparison_row("best", video, video.get("duration"))["message"]}
         else:
             amount, approximate = media_size(video, media_type)
-            if amount is None and platform == "Instagram" and media_type == "mp4":
+            if amount is None and platform != "YouTube" and media_type == "mp4":
                 for track in video.get("requested_formats") or [video]:
                     if not track.get("filesize") and not track.get("filesize_approx"):
-                        length = instagram_track_size(track)
+                        length = media_track_size(platform, track)
                         if length:
                             track["filesize"] = length
                 amount, approximate = media_size(video, media_type)
@@ -1152,13 +1255,16 @@ def photo_extension(prefix):
     raise ValueError("The server did not return a supported photo")
 
 
-def save_photo(photo, opener, job, show_bytes):
-    url = instagram_cdn_url(photo["url"])
+def save_photo(platform, photo, opener, job, show_bytes):
+    url = media_cdn_url(platform, photo["url"])
     if not url:
-        raise ValueError("No Instagram photo URL is available")
+        raise ValueError("No photo URL is available")
     with tempfile.TemporaryDirectory(dir=downloads) as folder:
         partial = Path(folder) / "photo.part"
-        request = Request(url, headers={"Accept-Encoding": "identity"})
+        headers = {"Accept-Encoding": "identity"}
+        if platform == "Twitter/X":
+            headers.update(twitter_photo_headers)
+        request = Request(url, headers=headers)
         with opener.open(request, timeout=10) as response, partial.open("wb") as stream:
             prefix = response.read(12)
             extension = photo_extension(prefix)
@@ -1179,7 +1285,8 @@ def save_photo(photo, opener, job, show_bytes):
                 return None
             if total is not None and received != total:
                 raise ValueError("The image transfer ended early")
-            path = downloads / f"Instagram photo [{photo['key']}]{extension}"
+            label = "Instagram" if platform == "Instagram" else "Twitter"
+            path = downloads / f"{label} photo [{photo['key']}]{extension}"
             partial.replace(path)
     return path
 
@@ -1215,7 +1322,7 @@ def photo_download_events(source, download_id, cancel_url, selected_positions=No
         history_error = False
         rate_limited = False
         downloads.mkdir(exist_ok=True)
-        opener = build_opener(InstagramCDNRedirect())
+        opener = build_opener(MediaCDNRedirect(source.platform))
         for photo in photos:
             if job.cancelled:
                 break
@@ -1225,17 +1332,17 @@ def photo_download_events(source, download_id, cancel_url, selected_positions=No
                 saved += 1
                 continue
             try:
-                path = yield from save_photo(photo, opener, job, show_bytes=count == 1)
+                path = yield from save_photo(source.platform, photo, opener, job, show_bytes=count == 1)
             except HTTPError as error:
                 error.close()
                 if error.code == 429:
                     pause_platform_requests(source.platform)
                     rate_limited = True
                     break
-                print(f"Instagram photo from slide {photo['position']} failed: HTTP {error.code}", flush=True)
+                print(f"{source.platform} photo from slide {photo['position']} failed: HTTP {error.code}", flush=True)
                 continue
             except (OSError, ValueError, HTTPException) as error:
-                print(f"Could not save Instagram photo from slide {photo['position']}: {error}", flush=True)
+                print(f"Could not save {source.platform} photo from slide {photo['position']}: {error}", flush=True)
                 continue
             if path is None:
                 break
@@ -1257,12 +1364,12 @@ def photo_download_events(source, download_id, cancel_url, selected_positions=No
             message = f"Download cancelled. {summary}" if count > 1 else "Download cancelled."
             yield download_event("cancelled", message, history_saved=history_saved)
         elif rate_limited:
-            message = "Instagram is rate-limiting requests. Try again later."
+            message = f"{source.platform} is rate-limiting requests. Try again later."
             if count > 1:
                 message = f"{summary} {message}"
             yield download_event("error", message, http_status=429, history_saved=history_saved)
         elif saved < count:
-            message = f"{summary} Try again for the remaining photos." if count > 1 else "Could not save the Instagram photo."
+            message = f"{summary} Try again for the remaining photos." if count > 1 else f"Could not save the {source.platform} photo."
             yield download_event("error", message, history_saved=history_saved)
         else:
             message = f"{summary} Open your Downloads folder." if count > 1 else download_complete
@@ -1276,7 +1383,7 @@ def photo_download_events(source, download_id, cancel_url, selected_positions=No
         if job.cancelled:
             yield download_event("cancelled", "Download cancelled.")
         else:
-            yield download_event("error", "Could not save the Instagram photo.")
+            yield download_event("error", f"Could not save the {source.platform} photo.")
     finally:
         with active_downloads_lock:
             active_downloads.pop(download_id, None)
@@ -1410,24 +1517,30 @@ def index():
     preview = None
     existing = None
     comparisons = []
-    is_instagram = False
+    best_only = False
     http_status = 200
     streaming = request.headers.get("Accept") == progress_type
     if request.method == "POST":
         source = video_source_from(link)
         if not source:
-            message = "Paste a YouTube video link or a public Instagram post or Reel link."
-        elif media_type == "image" and not source.url.startswith("https://www.instagram.com/p/"):
-            message = "Choose Instagram photo with a public Instagram photo post link."
+            message = "Paste a YouTube video, Instagram post or Reel, or Twitter/X post link."
+        elif media_type == "image" and source.platform == "YouTube":
+            message = "Choose a video or audio format for YouTube links."
+        elif media_type == "image" and source.platform == "Instagram" and not source.url.startswith("https://www.instagram.com/p/"):
+            message = "Paste a public Instagram photo post link."
         elif action == "download-selected" and media_type != "image":
-            message, http_status = "Choose Instagram photo to select slides.", 400
+            message, http_status = "Choose Photo (Instagram or X) to select photos.", 400
         else:
-            is_instagram = source.platform == "Instagram"
-            if is_instagram:
+            best_only = source.platform != "YouTube"
+            if best_only:
                 quality = "best"
             options = download_options(source.platform, media_type, quality)
-            history_key = f"instagram-{source.key}" if is_instagram else source.key
-            if is_instagram:
+            history_key = source.key
+            if best_only:
+                prefix = "instagram" if source.platform == "Instagram" else "twitter"
+                history_key = f"{prefix}-{source.key}"
+                if source.video_position and media_type != "image":
+                    history_key += f"-video-{source.video_position}"
                 options += ["-o", f"%(title)s [{history_key}].%(ext)s"]
             command = [*yt_dlp_command, *options]
             selection = f"{history_key}:{quality}:{media_type}"
@@ -1458,7 +1571,7 @@ def index():
                     except PreviewRequestError as error:
                         http_status, message = error.http_status, str(error)
                     else:
-                        if media_type == "mp4" and not is_instagram:
+                        if media_type == "mp4" and not best_only:
                             if quality not in sizes:
                                 quality = "best"
                                 if comparisons:
@@ -1478,5 +1591,5 @@ def index():
     return render_template_string(
         page, link=link, quality=quality, qualities=qualities, media_type=media_type,
         message=message, checked=checked, size=size, preview=preview, existing=existing,
-        comparisons=comparisons, is_instagram=is_instagram, **history_context(),
+        comparisons=comparisons, best_only=best_only, **history_context(),
     ), http_status
