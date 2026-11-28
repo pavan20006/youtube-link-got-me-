@@ -59,7 +59,8 @@ platform_pause_lock = Lock()
 platform_pause_until = {}
 platform_pause_seconds = 60
 
-app.jinja_loader = DictLoader({"history.html": """
+app.jinja_loader = DictLoader({
+    "history-entries.html": """
 {% if history %}
   <ul class="history-list">
     {% for item in history %}
@@ -78,7 +79,91 @@ app.jinja_loader = DictLoader({"history.html": """
 {% else %}
   <p>No completed downloads yet.</p>
 {% endif %}
-"""})
+""",
+    "open-saved-download.js": """
+async function openSavedDownload(event, feedback) {
+  if (!event.submitter) return;
+  event.preventDefault();
+  const data = new FormData();
+  data.set('target', event.submitter.value);
+  try {
+    const response = await fetch(event.target.getAttribute('action'), {method: 'POST', body: data});
+    const {message} = await response.json();
+    feedback.textContent = message;
+  } catch {
+    feedback.textContent = 'Could not open this download.';
+  }
+}
+""",
+    "history.html": """
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Download history</title>
+<style>
+  main { max-width: 38rem; }
+  .history-filters { display: flex; flex-wrap: wrap; align-items: end; gap: 0.5rem; }
+  .history-filters div { display: grid; gap: 0.25rem; }
+  .history-filters input, .history-filters select, .history-filters button { font: inherit; }
+  .history-list { list-style: none; padding: 0; }
+  .history-list li { padding: 0.75rem 0; border-bottom: 1px solid #b8bdc6; overflow-wrap: anywhere; }
+  .history-list p { margin: 0.35rem 0; }
+</style>
+<nav><a href="{{ url_for('index') }}">Back to downloader</a></nav>
+<main>
+  <h1>Download history</h1>
+  <form class="history-filters" method="get" action="{{ url_for('download_history') }}">
+    <div>
+      <label for="history-query">Search by title</label>
+      <input id="history-query" type="search" name="history_query" value="{{ history_query }}" maxlength="200">
+    </div>
+    <div>
+      <label for="history-format">File format</label>
+      <select id="history-format" name="history_format">
+        <option value="">All formats</option>
+        <option value="MP4" {% if history_format == 'MP4' %}selected{% endif %}>MP4</option>
+        <option value="MP3" {% if history_format == 'MP3' %}selected{% endif %}>MP3</option>
+        <option value="PHOTOS" {% if history_format == 'PHOTOS' %}selected{% endif %}>Photos</option>
+      </select>
+    </div>
+    <button type="submit">Filter history</button>
+  </form>
+  <div id="history-entries" data-url="{{ url_for('download_history_entries') }}">
+    {% include 'history-entries.html' %}
+  </div>
+  <p id="history-status" role="status"></p>
+</main>
+<script>
+  {% include 'open-saved-download.js' %}
+  const entries = document.querySelector('#history-entries');
+  const historyStatus = document.querySelector('#history-status');
+  entries.addEventListener('submit', event => openSavedDownload(event, historyStatus));
+
+  if (typeof BroadcastChannel === 'function') {
+    const updates = new BroadcastChannel('download-history');
+    const url = new URL(entries.dataset.url, window.location.href);
+    url.search = window.location.search;
+    let request;
+    updates.addEventListener('message', async () => {
+      request?.abort();
+      historyStatus.textContent = '';
+      const controller = new AbortController();
+      request = controller;
+      try {
+        const response = await fetch(url, {cache: 'no-store', signal: controller.signal});
+        if (!response.ok) throw new Error('History refresh failed');
+        const html = await response.text();
+        if (!controller.signal.aborted) entries.innerHTML = html;
+      } catch {
+        if (!controller.signal.aborted) historyStatus.textContent = 'Could not refresh download history. Reload to try again.';
+      }
+    });
+  }
+</script>
+</html>
+""",
+})
 
 page = r"""
 <!doctype html>
@@ -126,18 +211,14 @@ page = r"""
   .quality-comparison table { width: 100%; border-collapse: collapse; }
   .quality-comparison th, .quality-comparison td { text-align: left; padding: 0.5rem 0.375rem; border-bottom: 1px solid #b8bdc6; }
   .quality-comparison label { cursor: pointer; }
-  .download-history { margin-top: 1.5rem; max-width: 38rem; }
   .download-job { max-width: 36rem; padding: 0.75rem; margin: 0.75rem 0; border: 1px solid #b8bdc6; border-radius: 0.5rem; }
   .download-job h3 { margin: 0 0 0.5rem; font-size: 1.125rem; overflow-wrap: anywhere; }
   .download-job p { margin: 0.375rem 0; }
-  .history-filters { display: flex; flex-wrap: wrap; align-items: end; gap: 0.5rem; }
-  .history-filters div { display: grid; gap: 0.25rem; }
-  .history-filters input, .history-filters select, .history-filters button { font: inherit; }
-  .history-list { list-style: none; padding: 0; }
-  .history-list li { padding: 0.75rem 0; border-bottom: 1px solid #b8bdc6; overflow-wrap: anywhere; }
-  .history-list p { margin: 0.35rem 0; }
+  nav { margin-bottom: 1rem; }
 </style>
 <h1>My Video Downloader</h1>
+<nav><a href="{{ url_for('download_history') }}" target="_blank" rel="noopener"
+        aria-label="Download history (opens in a new tab)">Download history</a></nav>
 <form id="download-form" method="post" action="{{ url_for('index') }}">
   <label for="url">YouTube, Instagram, or Twitter/X link</label>
   <input id="url" name="url" type="url" value="{{ link }}" required>
@@ -273,29 +354,6 @@ page = r"""
     </div>
   </article>
 </template>
-<section class="download-history" aria-labelledby="history-title">
-  <h2 id="history-title">Download history</h2>
-  <form id="history-filters" class="history-filters" method="get" action="{{ url_for('index') }}">
-    <div>
-      <label for="history-query">Search by title</label>
-      <input id="history-query" type="search" name="history_query" value="{{ history_query }}" maxlength="200">
-    </div>
-    <div>
-      <label for="history-format">File format</label>
-      <select id="history-format" name="history_format">
-        <option value="">All formats</option>
-        <option value="MP4" {% if history_format == 'MP4' %}selected{% endif %}>MP4</option>
-        <option value="MP3" {% if history_format == 'MP3' %}selected{% endif %}>MP3</option>
-        <option value="PHOTOS" {% if history_format == 'PHOTOS' %}selected{% endif %}>Photos</option>
-      </select>
-    </div>
-    <button type="submit">Filter history</button>
-  </form>
-  <div id="history-entries" data-url="{{ url_for('download_history') }}">
-    {% include 'history.html' %}
-  </div>
-  <p id="history-status" role="status"></p>
-</section>
 <script>
   const form = document.querySelector('#download-form');
   const checkStatus = document.querySelector('#download-status');
@@ -309,57 +367,11 @@ page = r"""
   const jobs = document.querySelector('#download-jobs');
   const jobList = document.querySelector('#download-job-list');
   const jobTemplate = document.querySelector('#download-job-template');
-  const historyForm = document.querySelector('#history-filters');
-  const historyEntries = document.querySelector('#history-entries');
-  const historyStatus = document.querySelector('#history-status');
+  const historyUpdates = typeof BroadcastChannel === 'function' ? new BroadcastChannel('download-history') : null;
   const size = bytes => `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
   let youtubeQuality = form.elements.quality.disabled ? '720' : form.elements.quality.value;
   let previewRequest;
-  let historyFilters = new URLSearchParams(new FormData(historyForm));
-  let historyRequest;
-
-  async function refreshHistory() {
-    historyRequest?.abort();
-    const controller = new AbortController();
-    historyRequest = controller;
-    const url = new URL(historyEntries.dataset.url, window.location.href);
-    url.search = historyFilters;
-    try {
-      const response = await fetch(url, {cache: 'no-store', signal: controller.signal});
-      if (!response.ok) throw new Error('History refresh failed');
-      const html = await response.text();
-      if (historyRequest === controller) {
-        historyEntries.innerHTML = html;
-        historyStatus.textContent = '';
-      }
-    } catch {
-      if (!controller.signal.aborted) {
-        historyStatus.textContent = 'Could not refresh download history. Try again.';
-      }
-    }
-  }
-
-  historyForm.addEventListener('submit', event => {
-    event.preventDefault();
-    historyFilters = new URLSearchParams(new FormData(historyForm));
-    refreshHistory();
-  });
-
-  async function openSavedDownload(event, feedback) {
-    if (!event.submitter) return;
-    event.preventDefault();
-    const data = new FormData();
-    data.set('target', event.submitter.value);
-    try {
-      const response = await fetch(event.target.getAttribute('action'), {method: 'POST', body: data});
-      const {message} = await response.json();
-      feedback.textContent = message;
-    } catch {
-      feedback.textContent = 'Could not open this download.';
-    }
-  }
-
-  historyEntries.addEventListener('submit', event => openSavedDownload(event, historyStatus));
+  {% include 'open-saved-download.js' %}
   existingResult.addEventListener('submit', event => {
     openSavedDownload(event, document.querySelector('#existing-status'));
   });
@@ -572,7 +584,7 @@ page = r"""
           finished = ['complete', 'error', 'cancelled'].includes(update.state);
           if (finished) cancel.hidden = true;
           if (!cancelling || finished) showProgress(job, update);
-          if (update.history_saved) refreshHistory();
+          if (update.history_saved) historyUpdates?.postMessage('saved');
         }
       }
       if (!finished) throw new Error('Download connection closed');
@@ -861,6 +873,11 @@ def history_context():
 @app.get("/history")
 def download_history():
     return render_template("history.html", **history_context())
+
+
+@app.get("/history/entries")
+def download_history_entries():
+    return render_template("history-entries.html", **history_context())
 
 
 @app.post("/history/<int:item_id>/open")
@@ -1591,5 +1608,5 @@ def index():
     return render_template_string(
         page, link=link, quality=quality, qualities=qualities, media_type=media_type,
         message=message, checked=checked, size=size, preview=preview, existing=existing,
-        comparisons=comparisons, best_only=best_only, **history_context(),
+        comparisons=comparisons, best_only=best_only,
     ), http_status
