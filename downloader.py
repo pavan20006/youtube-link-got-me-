@@ -60,13 +60,135 @@ platform_pause_until = {}
 platform_pause_seconds = 60
 
 app.jinja_loader = DictLoader({
+    "app-style.css": """
+:root {
+  color-scheme: light;
+  --ink: #182a22;
+  --muted: #52655a;
+  --surface: #fff;
+  --wash: #f2f6ef;
+  --line: #dbe4da;
+  --green: #174b36;
+  --green-hover: #103b2a;
+  --focus: #38795b;
+  font-family: "Segoe UI", system-ui, sans-serif;
+}
+*, *::before, *::after { box-sizing: border-box; }
+body {
+  min-height: 100vh;
+  margin: 0;
+  background: radial-gradient(ellipse at 50% 0, #e8f1e6, transparent 40rem), #f6f7f2;
+  color: var(--ink);
+  line-height: 1.5;
+}
+a { color: var(--green); }
+button, input, select { font: inherit; }
+button, .nav-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.55rem 0.9rem;
+  min-height: 2.625rem;
+  color: var(--green);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 0.625rem;
+  font-weight: 650;
+  cursor: pointer;
+}
+button[hidden] { display: none; }
+button:hover, .nav-link:hover { background: var(--wash); border-color: #b9cbbb; }
+button:disabled { opacity: 0.55; cursor: default; }
+.primary {
+  color: #fff;
+  background: var(--green);
+  border-color: var(--green);
+}
+.primary:hover { background: var(--green-hover); border-color: var(--green-hover); }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+:is(input[type="url"], input[type="search"], select) {
+  width: 100%;
+  min-height: 3rem;
+  padding: 0.625rem 0.75rem;
+  border: 1px solid #c6d4c8;
+  border-radius: 0.625rem;
+  color: var(--ink);
+  background: var(--surface);
+}
+input::placeholder { color: #65776d; }
+input[type="checkbox"], input[type="radio"], progress { accent-color: var(--green); }
+select:disabled { background: var(--wash); color: var(--muted); }
+.site-header {
+  width: min(68rem, 100% - 2rem);
+  margin-inline: auto;
+  min-height: 5rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  border-bottom: 1px solid var(--line);
+}
+.wordmark {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  font-weight: 750;
+  line-height: 1.2;
+}
+.brand-icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 2.25rem;
+  aspect-ratio: 1;
+  border-radius: 0.625rem;
+  background: #cae7ca;
+  color: var(--green);
+  font-size: 1.4rem;
+}
+.nav-link { text-decoration: none; font-size: 0.9rem; }
+.page-shell { width: min(51rem, 100% - 2rem); margin: clamp(2.25rem, 8vw, 5rem) auto 4rem; }
+.page-heading {
+  margin: 0 0 1.5rem;
+  font-size: clamp(2.2rem, 6vw, 3.65rem);
+  line-height: 1.05;
+  letter-spacing: -0.055em;
+}
+.panel {
+  padding: clamp(1rem, 4vw, 2rem);
+  border: 1px solid var(--line);
+  border-radius: 1rem;
+  background: var(--surface);
+  box-shadow: 0 12px 36px rgb(25 63 38 / 6%);
+}
+.field { min-width: 0; }
+.field > label {
+  display: block;
+  margin-bottom: 0.4rem;
+  font-size: 0.875rem;
+  font-weight: 700;
+}
+.form-note, .history-list p, .empty-state { color: var(--muted); }
+.form-note { margin: 1.25rem 0 0; padding-top: 1rem; border-top: 1px solid var(--line); font-size: 0.875rem; }
+@media (max-width: 30rem) {
+  .site-header { min-height: 4.25rem; }
+  .wordmark { gap: 0.45rem; font-size: 0.875rem; }
+  .brand-icon { flex-basis: 1.875rem; align-self: center; font-size: 1.2rem; }
+  .nav-link { padding-inline: 0.625rem; font-size: 0.8rem; white-space: nowrap; }
+}
+""",
+    "wordmark.html": """
+<span class="wordmark"><span class="brand-icon" aria-hidden="true">↓</span>My Video Downloader</span>
+""",
     "history-entries.html": """
 {% if history %}
   <ul class="history-list">
     {% for item in history %}
       <li>
-        <strong>{{ item.title }}</strong>
-        <p>{{ item.format }}{% if item.height %} · {{ item.height }}p{% endif %} · {{ item.size }} · {{ item.date }}</p>
+        <div>
+          <strong>{{ item.title }}</strong>
+          <p>{{ item.format }}{% if item.height %} · {{ item.height }}p{% endif %} · {{ item.size }} · {{ item.date }}</p>
+        </div>
         <form action="{{ url_for('open_history_item', item_id=item.id) }}" method="post">
           <button type="submit" name="target" value="file">Open file</button>
           <button type="submit" name="target" value="folder">Open folder</button>
@@ -75,9 +197,9 @@ app.jinja_loader = DictLoader({
     {% endfor %}
   </ul>
 {% elif history_query or history_format %}
-  <p>No downloads match your filters.</p>
+  <p class="empty-state">No downloads match your filters.</p>
 {% else %}
-  <p>No completed downloads yet.</p>
+  <p class="empty-state">No completed downloads yet.</p>
 {% endif %}
 """,
     "open-saved-download.js": """
@@ -102,23 +224,32 @@ async function openSavedDownload(event, feedback) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Download history</title>
 <style>
-  main { max-width: 38rem; }
-  .history-filters { display: flex; flex-wrap: wrap; align-items: end; gap: 0.5rem; }
-  .history-filters div { display: grid; gap: 0.25rem; }
-  .history-filters input, .history-filters select, .history-filters button { font: inherit; }
-  .history-list { list-style: none; padding: 0; }
-  .history-list li { padding: 0.75rem 0; border-bottom: 1px solid #b8bdc6; overflow-wrap: anywhere; }
-  .history-list p { margin: 0.35rem 0; }
+  {% include 'app-style.css' %}
+  .history-filters { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) auto; align-items: end; gap: 0.75rem; }
+  .history-filters .primary { min-height: 3rem; }
+  .history-list { list-style: none; margin: 1.5rem 0 0; padding: 0; border-top: 1px solid var(--line); }
+  .history-list li { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.75rem 1rem; padding: 1rem 0; overflow-wrap: anywhere; }
+  .history-list li + li { border-top: 1px solid var(--line); }
+  .history-list li > div { flex: 1 1 16rem; min-width: 0; }
+  .history-list p { margin: 0.25rem 0 0; font-size: 0.875rem; }
+  .history-list form { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+  .empty-state { padding: 1.75rem 1rem; margin: 1.5rem 0 0; text-align: center; background: var(--wash); border-radius: 0.625rem; }
+  #history-status:empty { margin: 0; }
+  @media (max-width: 36rem) { .history-filters { grid-template-columns: 1fr; } }
 </style>
-<nav><a href="{{ url_for('index') }}">Back to downloader</a></nav>
-<main>
-  <h1>Download history</h1>
+<header class="site-header">
+  {% include 'wordmark.html' %}
+  <nav><a class="nav-link" href="{{ url_for('index') }}">Back to downloader</a></nav>
+</header>
+<main class="page-shell">
+  <h1 class="page-heading">Download history</h1>
+  <section class="panel" aria-label="Search and filter downloads">
   <form class="history-filters" method="get" action="{{ url_for('download_history') }}">
-    <div>
+    <div class="field">
       <label for="history-query">Search by title</label>
       <input id="history-query" type="search" name="history_query" value="{{ history_query }}" maxlength="200">
     </div>
-    <div>
+    <div class="field">
       <label for="history-format">File format</label>
       <select id="history-format" name="history_format">
         <option value="">All formats</option>
@@ -127,12 +258,13 @@ async function openSavedDownload(event, feedback) {
         <option value="PHOTOS" {% if history_format == 'PHOTOS' %}selected{% endif %}>Photos</option>
       </select>
     </div>
-    <button type="submit">Filter history</button>
+    <button class="primary" type="submit">Filter history</button>
   </form>
   <div id="history-entries" data-url="{{ url_for('download_history_entries') }}">
     {% include 'history-entries.html' %}
   </div>
   <p id="history-status" role="status"></p>
+  </section>
 </main>
 <script>
   {% include 'open-saved-download.js' %}
@@ -172,27 +304,39 @@ page = r"""
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>My Video Downloader</title>
 <style>
-  progress { width: min(100%, 24rem); height: 1.25rem; }
+  {% include 'app-style.css' %}
+  .form-options {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr) auto;
+    align-items: end;
+    gap: 0.75rem;
+    margin-top: 1rem;
+  }
+  .form-options .primary { min-height: 3rem; padding-inline: 1.4rem; }
+  #url { min-height: 3.25rem; }
+  #download-status { margin: 1rem 0 0; padding: 0.75rem 1rem; border-radius: 0.625rem; background: var(--wash); }
+  #download-status:empty, #existing-status:empty { margin: 0; padding: 0; }
+  progress { width: min(100%, 30rem); height: 1.25rem; }
   .video-preview {
     display: flex;
     flex-wrap: wrap;
     gap: 1rem;
     align-items: center;
-    max-width: 36rem;
-    margin: 1rem 0;
-    padding: 0.75rem;
-    border: 1px solid #b8bdc6;
-    border-radius: 0.5rem;
+    margin: 1.25rem 0 1rem;
+    padding: 1rem;
+    border: 1px solid var(--line);
+    border-radius: 0.75rem;
+    background: var(--wash);
   }
-  .video-preview img { max-width: 100%; height: auto; border-radius: 0.25rem; }
+  .video-preview img { max-width: 100%; height: auto; border-radius: 0.5rem; }
   .video-preview div { flex: 1 1 12rem; min-width: 0; overflow-wrap: anywhere; }
   .video-preview h2 { font-size: 1.125rem; margin: 0; }
   .video-preview p { margin: 0.375rem 0 0; }
   .photo-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr)); gap: 0.75rem; padding: 0; list-style: none; }
-  .photo-grid img { display: block; width: 100%; aspect-ratio: 1; object-fit: contain; background: #edf0f4; }
+  .photo-grid img { display: block; width: 100%; aspect-ratio: 1; object-fit: contain; background: #e4ece4; }
   .photo-grid span { display: block; margin-top: 0.25rem; }
   .photo-grid label { display: block; padding: 0.25rem; border-radius: 0.25rem; cursor: pointer; }
-  .photo-grid label:has(:checked) { outline: 2px solid #1647a6; background: #eaf0ff; }
+  .photo-grid label:has(:checked) { outline: 2px solid var(--focus); background: #e3efe1; }
   .photo-grid button { margin: 0.375rem 0.25rem 0; }
   .photo-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.75rem; }
   #photo-preview-dialog {
@@ -200,41 +344,68 @@ page = r"""
     width: min(60rem, calc(100% - 2rem));
     max-height: calc(100% - 2rem);
     padding: 1rem;
-    border: 1px solid #b8bdc6;
-    border-radius: 0.5rem;
+    border: 1px solid var(--line);
+    border-radius: 1rem;
+    color: var(--ink);
   }
   #photo-preview-dialog::backdrop { background: rgb(0 0 0 / 65%); }
   .photo-dialog-header { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
   .photo-dialog-header h2 { margin: 0; }
   #enlarged-photo { display: block; width: 100%; height: 68vh; object-fit: contain; margin: 0.75rem 0; background: #edf0f4; }
-  .quality-comparison { margin: 0 0 1rem; min-width: 0; max-width: 37.5rem; }
+  .quality-comparison { margin: 0 0 1rem; min-width: 0; border: 1px solid var(--line); border-radius: 0.75rem; padding: 0.5rem; }
+  .quality-comparison legend { font-weight: 650; }
   .quality-comparison table { width: 100%; border-collapse: collapse; }
-  .quality-comparison th, .quality-comparison td { text-align: left; padding: 0.5rem 0.375rem; border-bottom: 1px solid #b8bdc6; }
+  .quality-comparison th, .quality-comparison td { text-align: left; padding: 0.5rem 0.375rem; border-bottom: 1px solid var(--line); }
+  .quality-comparison tbody tr:last-child td { border-bottom: 0; }
   .quality-comparison label { cursor: pointer; }
-  .download-job { max-width: 36rem; padding: 0.75rem; margin: 0.75rem 0; border: 1px solid #b8bdc6; border-radius: 0.5rem; }
+  #download-jobs { margin-top: 2rem; }
+  #jobs-title { margin-bottom: 0.75rem; }
+  .download-job { margin: 0.75rem 0; }
   .download-job h3 { margin: 0 0 0.5rem; font-size: 1.125rem; overflow-wrap: anywhere; }
   .download-job p { margin: 0.375rem 0; }
-  nav { margin-bottom: 1rem; }
+  .video-preview form { display: inline-block; margin-top: 0.75rem; }
+  @media (max-width: 36rem) {
+    .form-options { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .form-options .primary { grid-column: 1 / -1; }
+    .quality-comparison table { font-size: 0.875rem; overflow-wrap: anywhere; }
+  }
+  @media (max-width: 32rem) {
+    .form-options { grid-template-columns: minmax(0, 1fr); }
+  }
 </style>
-<h1>My Video Downloader</h1>
-<nav><a href="{{ url_for('download_history') }}" target="_blank" rel="noopener"
-        aria-label="Download history (opens in a new tab)">Download history</a></nav>
+<header class="site-header">
+  {% include 'wordmark.html' %}
+  <nav><a class="nav-link" href="{{ url_for('download_history') }}" target="_blank" rel="noopener"
+          aria-label="Download history (opens in a new tab)">Download history</a></nav>
+</header>
+<main class="page-shell">
+<h1 class="page-heading">Download media</h1>
+<div class="panel">
 <form id="download-form" method="post" action="{{ url_for('index') }}">
-  <label for="url">YouTube, Instagram, or Twitter/X link</label>
-  <input id="url" name="url" type="url" value="{{ link }}" required>
-  <label for="quality">Video quality</label>
-  <select id="quality" name="quality" {% if best_only %}disabled{% endif %}>
-    {% for value, label in qualities.items() %}
-      <option value="{{ value }}" {% if value == quality %}selected{% endif %}>{{ label }}</option>
-    {% endfor %}
-  </select>
-  <label for="format">Format</label>
-  <select id="format" name="format">
-    <option value="mp4">MP4 video with sound</option>
-    <option value="mp3" {% if media_type == 'mp3' %}selected{% endif %}>MP3 audio only</option>
-    <option value="image" {% if media_type == 'image' %}selected{% endif %}>Photo (Instagram or X)</option>
-  </select>
-  <button type="submit" name="action" value="check">Check size</button>
+  <div class="field">
+    <label for="url">YouTube, Instagram, or Twitter/X link</label>
+    <input id="url" name="url" type="url" value="{{ link }}" placeholder="https://…" required>
+  </div>
+  <div class="form-options">
+    <div class="field">
+      <label for="quality">Video quality</label>
+      <select id="quality" name="quality" {% if best_only %}disabled{% endif %}>
+        {% for value, label in qualities.items() %}
+          <option value="{{ value }}" {% if value == quality %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label for="format">Format</label>
+      <select id="format" name="format">
+        <option value="mp4">MP4 video with sound</option>
+        <option value="mp3" {% if media_type == 'mp3' %}selected{% endif %}>MP3 audio only</option>
+        <option value="image" {% if media_type == 'image' %}selected{% endif %}>Photo (Instagram or X)</option>
+      </select>
+    </div>
+    <button class="primary" type="submit" name="action" value="check">Check size</button>
+  </div>
+  <p class="form-note">Files are saved to your Downloads folder.</p>
   <div id="checked-result">
   {% if checked %}
     <div id="checked-video">
@@ -253,7 +424,7 @@ page = r"""
           <div class="photo-actions">
             <button type="button" data-photo-selection="all" hidden>Select all</button>
             <button type="button" data-photo-selection="clear" hidden>Clear selection</button>
-            <button type="submit" name="action" value="download-selected">Download selected</button>
+            <button class="primary" type="submit" name="action" value="download-selected">Download selected</button>
             <button type="submit" name="action" value="download">Download all photos</button>
           </div>
           <p id="photo-selection-status" role="status" hidden></p>
@@ -302,7 +473,7 @@ page = r"""
         <input type="hidden" name="checked" value="{{ selection }}">
       {% endfor %}
       {% if preview.photos | length <= 1 %}
-      <button type="submit" name="action" value="download">{{ 'Download image' if media_type == 'image' else 'Download' }}</button>
+      <button class="primary" type="submit" name="action" value="download">{{ 'Download image' if media_type == 'image' else 'Download' }}</button>
       {% endif %}
     </div>
   {% endif %}
@@ -339,12 +510,14 @@ page = r"""
 {% endif %}
 </div>
 <p id="download-status" role="status">{{ message }}</p>
+</div>
 <section id="download-jobs" aria-labelledby="jobs-title" hidden>
   <h2 id="jobs-title">Downloads</h2>
   <div id="download-job-list"></div>
 </section>
+</main>
 <template id="download-job-template">
-  <article class="download-job">
+  <article class="download-job panel">
     <h3></h3>
     <p class="job-status" role="status"></p>
     <div class="job-progress">
