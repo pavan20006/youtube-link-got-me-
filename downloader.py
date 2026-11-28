@@ -40,6 +40,11 @@ download_complete = "Download complete. Open your Downloads folder."
 download_failed = "Download failed. Check the PowerShell window."
 photo_types = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
 twitter_photo_headers = {"User-Agent": "Mozilla/5.0", "Accept": "image/*"}
+history_sorts = {
+    "newest": ("Newest first", "downloaded_at DESC, id DESC"),
+    "oldest": ("Oldest first", "downloaded_at ASC, id ASC"),
+    "largest": ("Largest files first", "size DESC, downloaded_at DESC, id DESC"),
+}
 
 
 @dataclass
@@ -226,7 +231,7 @@ async function openSavedDownload(event, feedback) {
 <title>Download history</title>
 <style>
   {% include 'app-style.css' %}
-  .history-filters { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) auto; align-items: end; gap: 0.75rem; }
+  .history-filters { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr) minmax(10.5rem, 1.2fr) auto; align-items: end; gap: 0.75rem; }
   .history-filters .primary { min-height: 3rem; }
   .history-list { list-style: none; margin: 1.5rem 0 0; padding: 0; border-top: 1px solid var(--line); }
   .history-list li { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.75rem 1rem; padding: 1rem 0; overflow-wrap: anywhere; }
@@ -236,7 +241,8 @@ async function openSavedDownload(event, feedback) {
   .history-list form { display: flex; flex-wrap: wrap; gap: 0.5rem; }
   .empty-state { padding: 1.75rem 1rem; margin: 1.5rem 0 0; text-align: center; background: var(--wash); border-radius: 0.625rem; }
   #history-status:empty { margin: 0; }
-  @media (max-width: 36rem) { .history-filters { grid-template-columns: 1fr; } }
+  @media (max-width: 44rem) { .history-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 32rem) { .history-filters { grid-template-columns: minmax(0, 1fr); } }
 </style>
 <header class="site-header">
   {% include 'wordmark.html' %}
@@ -257,6 +263,14 @@ async function openSavedDownload(event, feedback) {
         <option value="MP4" {% if history_format == 'MP4' %}selected{% endif %}>MP4</option>
         <option value="MP3" {% if history_format == 'MP3' %}selected{% endif %}>MP3</option>
         <option value="PHOTOS" {% if history_format == 'PHOTOS' %}selected{% endif %}>Photos</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="history-sort">Sort by</label>
+      <select id="history-sort" name="history_sort">
+        {% for value, option in history_sorts.items() %}
+          <option value="{{ value }}" {% if history_sort == value %}selected{% endif %}>{{ option[0] }}</option>
+        {% endfor %}
       </select>
     </div>
     <button class="primary" type="submit">Filter history</button>
@@ -1072,7 +1086,7 @@ def record_download(video):
         """, (str(path), video.get("title") or path.stem, media_type, height, size, downloaded_at))
 
 
-def history_rows(item_id=None, *, query="", media_format="", filename_suffix=""):
+def history_rows(item_id=None, *, query="", media_format="", filename_suffix="", sort="newest"):
     if not history_database.is_file():
         return []
     with closing(sqlite3.connect(history_database)) as connection:
@@ -1081,12 +1095,13 @@ def history_rows(item_id=None, *, query="", media_format="", filename_suffix="")
             return connection.execute("SELECT path FROM downloads WHERE id = ?", (item_id,)).fetchall()
         connection.create_function("casefold", 1, str.casefold)
         query = query.casefold()
-        return connection.execute("""
+        order_by = history_sorts.get(sort, history_sorts["newest"])[1]
+        return connection.execute(f"""
             SELECT id, path, title, format, height, size, downloaded_at FROM downloads
             WHERE (? = '' OR instr(casefold(title), ?) > 0)
               AND (? = '' OR format = ? OR (? = 'PHOTOS' AND format IN ('JPG', 'PNG', 'WEBP')))
               AND (? = '' OR substr(path, -length(?)) = ?)
-            ORDER BY downloaded_at DESC, id DESC LIMIT 50
+            ORDER BY {order_by} LIMIT 50
         """, (query, query, media_format, media_format, media_format, filename_suffix, filename_suffix, filename_suffix)).fetchall()
 
 
@@ -1111,14 +1126,14 @@ def find_existing_download(key, media_type):
     return None
 
 
-def recent_history(query, media_format):
+def recent_history(query, media_format, sort="newest"):
     try:
         return [
             {
                 **dict(item), "size": format_mib(item["size"]),
                 "date": datetime.fromisoformat(item["downloaded_at"]).astimezone().strftime("%d %b %Y, %H:%M"),
             }
-            for item in history_rows(query=query, media_format=media_format)
+            for item in history_rows(query=query, media_format=media_format, sort=sort)
         ]
     except (OSError, sqlite3.Error, ValueError) as error:
         print(f"Could not read download history: {error}", flush=True)
@@ -1130,10 +1145,15 @@ def history_context():
     media_format = request.args.get("history_format", "").upper()
     if media_format not in {"MP4", "MP3", "PHOTOS"}:
         media_format = ""
+    sort = request.args.get("history_sort", "newest")
+    if sort not in history_sorts:
+        sort = "newest"
     return {
-        "history": recent_history(query, media_format),
+        "history": recent_history(query, media_format, sort),
         "history_query": query,
         "history_format": media_format,
+        "history_sort": sort,
+        "history_sorts": history_sorts,
     }
 
 
