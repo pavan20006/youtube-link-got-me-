@@ -46,6 +46,7 @@ twitter_photo_headers = {"User-Agent": "Mozilla/5.0", "Accept": "image/*"}
 class ActiveDownload:
     process: subprocess.Popen | None = None
     cancelled: bool = False
+    batch: bool = False
 
 
 active_downloads = {}
@@ -357,6 +358,9 @@ page = r"""
   .photo-dialog-header { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
   .photo-dialog-header h2 { margin: 0; }
   #enlarged-photo { display: block; width: 100%; height: 68vh; object-fit: contain; margin: 0.75rem 0; background: #edf0f4; }
+  #post-video-player { display: block; width: 100%; max-height: 68vh; margin: 0.75rem 0; background: #182a22; }
+  #enlarged-photo[hidden], #post-video-player[hidden] { display: none; }
+  .photo-grid .media-placeholder { display: grid; place-items: center; aspect-ratio: 1; background: #e4ece4; border-radius: 0.5rem; }
   .quality-comparison { margin: 0 0 1rem; min-width: 0; border: 1px solid var(--line); border-radius: 0.75rem; padding: 0.5rem; }
   .quality-comparison legend { font-weight: 650; }
   .quality-comparison table { width: 100%; border-collapse: collapse; }
@@ -410,16 +414,17 @@ page = r"""
         <option value="mp4">MP4 video with sound</option>
         <option value="mp3" {% if media_type == 'mp3' %}selected{% endif %}>MP3 audio only</option>
         <option value="image" {% if media_type == 'image' %}selected{% endif %}>Photo (Instagram or X)</option>
+        <option value="mixed" {% if media_type == 'mixed' %}selected{% endif %}>Photos and videos</option>
       </select>
     </div>
-    <button class="primary" type="submit" name="action" value="check">Check size</button>
+    <button class="primary" type="submit" name="action" value="check">{{ 'Preview post' if media_type == 'mixed' else 'Check size' }}</button>
   </div>
   <p class="form-note">Files are saved to your Downloads folder.</p>
   <div id="checked-result">
   {% if checked %}
     <div id="checked-video">
       <article class="video-preview" aria-labelledby="video-title">
-        {% if preview.thumbnail and preview.photos | length <= 1 %}
+        {% if media_type != 'mixed' and preview.thumbnail and preview.photos | length <= 1 %}
         <img src="{{ preview.thumbnail }}" alt="" width="192" height="144" referrerpolicy="no-referrer">
         {% elif not best_only %}
         <img src="https://i.ytimg.com/vi/{{ preview.id }}/hqdefault.jpg" alt=""
@@ -427,24 +432,37 @@ page = r"""
         {% endif %}
         <div>
           <h2 id="video-title">{{ preview.title }}</h2>
-          {% if media_type != 'image' %}<p>Duration: {{ preview.duration }}</p>{% endif %}
-          {% if preview.photos | length > 1 %}
-          <p>{{ preview.photos | length }} photos</p>
+          {% if media_type in ('mp4', 'mp3') %}<p>Duration: {{ preview.duration }}</p>{% endif %}
+          {% if media_type == 'mixed' or preview.photos | length > 1 %}
+          {% set mixed = media_type == 'mixed' %}
+          {% set items = preview.media_items if mixed else preview.photos %}
+          <p>{{ items | length }} {{ ('item' if items | length == 1 else 'items') if mixed else 'photos' }}</p>
           <div class="photo-actions">
             <button type="button" data-photo-selection="all" hidden>Select all</button>
             <button type="button" data-photo-selection="clear" hidden>Clear selection</button>
             <button class="primary" type="submit" name="action" value="download-selected">Download selected</button>
-            <button type="submit" name="action" value="download">Download all photos</button>
+            <button type="submit" name="action" value="download">{{ 'Download all items' if mixed else 'Download all photos' }}</button>
           </div>
           <p id="photo-selection-status" role="status" hidden></p>
           <ul class="photo-grid">
-            {% for photo in preview.photos %}
+            {% for item in items %}
+            {% set video_item = item.kind == 'video' %}
+            {% set item_label = ('Video' if video_item else 'Photo') ~ ' · Slide ' ~ item.position if mixed else 'Slide ' ~ item.position %}
             <li>
               <label>
-                <img src="{{ photo.url }}" alt="" width="160" height="160" loading="lazy" referrerpolicy="no-referrer">
-                <span><input type="checkbox" name="photo_position" value="{{ photo.position }}"> Slide {{ photo.position }}</span>
+                {% if not video_item or item.thumbnail %}
+                  <img src="{{ item.thumbnail if video_item else item.url }}" alt="" width="160" height="160" loading="lazy" referrerpolicy="no-referrer">
+                {% else %}
+                  <span class="media-placeholder" aria-hidden="true">No thumbnail</span>
+                {% endif %}
+                <span><input type="checkbox" name="{{ 'media_position' if mixed else 'photo_position' }}" value="{{ item.position }}"> {{ item_label }}</span>
               </label>
-              <button type="button" data-enlarge-photo aria-label="Enlarge slide {{ photo.position }}" hidden>Enlarge</button>
+              {% if video_item and item.duration != 'Unavailable' %}<small>{{ item.duration }}</small>{% endif %}
+              {% if not video_item or item.playback %}
+                <button type="button" data-enlarge-photo data-title="{{ item_label }}"
+                        {% if video_item %}data-playback="{{ item.playback }}" aria-label="Preview video on slide {{ item.position }}"{% else %}aria-label="Enlarge slide {{ item.position }}"{% endif %}
+                        hidden>{{ 'Preview video' if video_item else 'Enlarge' }}</button>
+              {% endif %}
             </li>
             {% endfor %}
           </ul>
@@ -481,7 +499,7 @@ page = r"""
       {% for selection in checked %}
         <input type="hidden" name="checked" value="{{ selection }}">
       {% endfor %}
-      {% if preview.photos | length <= 1 %}
+      {% if media_type != 'mixed' and preview.photos | length <= 1 %}
       <button class="primary" type="submit" name="action" value="download">{{ 'Download image' if media_type == 'image' else 'Download' }}</button>
       {% endif %}
     </div>
@@ -496,7 +514,8 @@ page = r"""
     </form>
   </div>
   <img id="enlarged-photo" alt="Enlarged photo" referrerpolicy="no-referrer">
-  <label><input type="checkbox" id="enlarged-photo-selection"> Select this photo</label>
+  <video id="post-video-player" controls preload="none" hidden></video>
+  <label><input type="checkbox" id="enlarged-photo-selection"> <span id="enlarged-selection-label">Select this photo</span></label>
 </dialog>
 <div id="existing-result">
 {% if existing %}
@@ -541,12 +560,16 @@ page = r"""
   const urlField = form.elements.url;
   const pasteLink = document.querySelector('#paste-link');
   const pasteStatus = document.querySelector('#paste-status');
+  const previewButton = form.querySelector('button[value="check"]');
   const checkStatus = document.querySelector('#download-status');
   const checkedResult = document.querySelector('#checked-result');
   const photoDialog = document.querySelector('#photo-preview-dialog');
   const enlargedPhotoTitle = document.querySelector('#enlarged-photo-title');
   const enlargedPhoto = document.querySelector('#enlarged-photo');
+  const postVideoPlayer = document.querySelector('#post-video-player');
   const enlargedPhotoSelection = document.querySelector('#enlarged-photo-selection');
+  const enlargedSelectionLabel = document.querySelector('#enlarged-selection-label');
+  const itemCheckbox = 'input:is([name="photo_position"], [name="media_position"])';
   let enlargedPhotoInput;
   const existingResult = document.querySelector('#existing-result');
   const jobs = document.querySelector('#download-jobs');
@@ -601,8 +624,8 @@ page = r"""
   function updatePhotoSelection() {
     const feedback = checkedResult.querySelector('#photo-selection-status');
     if (!feedback) return;
-    const inputs = checkedResult.querySelectorAll('input[name="photo_position"]');
-    const count = checkedResult.querySelectorAll('input[name="photo_position"]:checked').length;
+    const inputs = checkedResult.querySelectorAll(itemCheckbox);
+    const count = checkedResult.querySelectorAll(`${itemCheckbox}:checked`).length;
     const submit = checkedResult.querySelector('button[value="download-selected"]');
     submit.disabled = count === 0 || submit.getAttribute('aria-busy') === 'true';
     feedback.hidden = false;
@@ -617,16 +640,21 @@ page = r"""
     const enlargeButton = event.target.closest('button[data-enlarge-photo]');
     if (enlargeButton) {
       const tile = enlargeButton.closest('li');
-      enlargedPhotoInput = tile.querySelector('input[name="photo_position"]');
-      enlargedPhotoTitle.textContent = `Slide ${enlargedPhotoInput.value}`;
-      enlargedPhoto.src = tile.querySelector('img').src;
+      enlargedPhotoInput = tile.querySelector(itemCheckbox);
+      enlargedPhotoTitle.textContent = enlargeButton.dataset.title;
+      const playback = enlargeButton.dataset.playback;
+      enlargedPhoto.hidden = Boolean(playback);
+      postVideoPlayer.hidden = !playback;
+      enlargedSelectionLabel.textContent = playback ? 'Select this video' : 'Select this photo';
+      if (playback) postVideoPlayer.src = playback;
+      else enlargedPhoto.src = tile.querySelector('img').src;
       enlargedPhotoSelection.checked = enlargedPhotoInput.checked;
       photoDialog.showModal();
       return;
     }
     const button = event.target.closest('button[data-photo-selection]');
     if (!button) return;
-    checkedResult.querySelectorAll('input[name="photo_position"]').forEach(input => {
+    checkedResult.querySelectorAll(itemCheckbox).forEach(input => {
       input.checked = button.dataset.photoSelection === 'all';
     });
     updatePhotoSelection();
@@ -638,13 +666,21 @@ page = r"""
   });
   photoDialog.addEventListener('close', () => {
     enlargedPhoto.removeAttribute('src');
+    if (postVideoPlayer.hasAttribute('src')) {
+      postVideoPlayer.pause();
+      postVideoPlayer.removeAttribute('src');
+      postVideoPlayer.load();
+    }
     enlargedPhotoInput = undefined;
   });
 
   updatePhotoSelection();
   form.addEventListener('input', event => {
     if (event.target === urlField) pasteStatus.textContent = '';
-    if (event.target.name === 'photo_position') {
+    if (event.target.name === 'format') {
+      previewButton.textContent = event.target.value === 'mixed' ? 'Preview post' : 'Check size';
+    }
+    if (event.target.matches(itemCheckbox)) {
       updatePhotoSelection();
       return;
     }
@@ -670,7 +706,8 @@ page = r"""
     const controller = new AbortController();
     previewRequest = controller;
     checkedResult.replaceChildren();
-    checkStatus.textContent = 'Checking size…';
+    const mixed = data.get('format') === 'mixed';
+    checkStatus.textContent = mixed ? 'Loading post…' : 'Checking size…';
     try {
       const response = await fetch(form.getAttribute('action'), {
         method: 'POST', body: data, signal: controller.signal,
@@ -687,7 +724,7 @@ page = r"""
       checkStatus.textContent = page.querySelector('#download-status').textContent;
     } catch {
       if (!controller.signal.aborted) {
-        checkStatus.textContent = 'Could not check the size. Try again.';
+        checkStatus.textContent = mixed ? 'Could not preview the post. Try again.' : 'Could not check the size. Try again.';
       }
     } finally {
       if (previewRequest === controller) previewRequest = null;
@@ -699,10 +736,17 @@ page = r"""
     if (status.textContent !== event.message) status.textContent = event.message;
     if (event.state === 'complete') {
       bar.value = 100;
-      details.textContent = event.photo_count ? `${event.photo_count} photos saved` : '100%';
+      if (event.item_count) details.textContent = `${event.item_count} ${event.item_count === 1 ? 'item' : 'items'} ready`;
+      else details.textContent = event.photo_count ? `${event.photo_count} photos saved` : '100%';
       return;
     }
     if (event.state === 'error' || event.state === 'cancelled') progress.hidden = true;
+    if (event.item_count) {
+      const itemProgress = event.total && event.downloaded != null ? Math.min(1, event.downloaded / event.total) : 0;
+      bar.value = (event.items_saved + itemProgress) / event.item_count * 100;
+      details.textContent = `${event.items_saved} of ${event.item_count} items ready`;
+      return;
+    }
     if (event.photo_count) {
       bar.value = event.photos_saved / event.photo_count * 100;
       details.textContent = `${event.photos_saved} of ${event.photo_count} photos saved`;
@@ -1166,16 +1210,16 @@ def video_format(quality):
     return f"bv*[height<={quality}]+ba/b[height<={quality}]"
 
 
-def download_options(platform, media_type, quality="best"):
+def download_options(platform, media_type, quality="best", *, playlist_position=1):
     if media_type == "image":
         return ["--ignore-no-formats-error"]
-    options = ["--playlist-items", "1"] if platform != "YouTube" else []
+    options = ["--playlist-items", str(playlist_position)] if platform != "YouTube" else []
     if platform == "Twitter/X":
         options += ["--ies", "twitter,twitter:amplify,twitter:card"]
     if media_type == "mp3":
         return [*options, "-x", "--audio-format", "mp3"]
     if platform == "Instagram":
-        return [*options, "-f", "b[ext=mp4]/bv[ext=mp4]+ba[ext=m4a]", "--merge-output-format", "mp4"]
+        return [*options, "-f", "b[ext=mp4]/bv[ext=mp4]+ba[ext=m4a]/bv[ext=mp4]", "--merge-output-format", "mp4"]
     options += ["-t", "mp4"]
     if quality != "best":
         options += ["-f", video_format(quality)]
@@ -1260,7 +1304,7 @@ def cancel_download(download_id):
         if job.cancelled:
             return "", 202
         try:
-            job.cancelled = job.process is None or stop_process_tree(job.process)
+            job.cancelled = job.process is None or stop_process_tree(job.process) or job.batch
         except (OSError, subprocess.SubprocessError) as error:
             print(f"Could not cancel the download: {error}", flush=True)
             return "", 500
@@ -1304,26 +1348,58 @@ class PreviewRequestError(Exception):
         self.http_status = http_status
 
 
-def instagram_photos(video, key):
+def instagram_entries(video):
     entries = (video.get("entries") or []) if video.get("_type") == "playlist" else [video]
-    photos = []
     for index, entry in enumerate(entries, 1):
-        if not isinstance(entry, dict) or entry.get("formats") or entry.get("url") or entry.get("duration"):
+        if isinstance(entry, dict):
+            position = entry.get("playlist_index")
+            yield (position if isinstance(position, int) and position > 0 else index), entry
+
+
+def instagram_photos(video, key):
+    photos = []
+    for position, entry in instagram_entries(video):
+        if entry.get("formats") or entry.get("url") or entry.get("duration"):
             continue
         thumbnail = instagram_cdn_url(entry.get("thumbnail"))
         if thumbnail:
-            position = entry.get("playlist_index") or index
             suffix = "" if position == 1 else f"-{position:02d}"
             photos.append({"position": position, "url": thumbnail, "key": f"instagram-{key}{suffix}"})
     return photos
 
 
-def twitter_photo_preview(key):
+def instagram_post_preview(video, key):
+    items = [{**photo, "kind": "photo"} for photo in instagram_photos(video, key)]
+    for position, entry in instagram_entries(video):
+        if not (entry.get("formats") or entry.get("url")):
+            continue
+        playback = None
+        for candidate in reversed(entry.get("formats") or [entry]):
+            if candidate.get("ext") != "mp4" or candidate.get("fragments") or candidate.get("protocol") not in (None, "http", "https"):
+                continue
+            if candidate.get("vcodec") != "none":
+                url = instagram_cdn_url(candidate.get("url"))
+                if url and (not playback or candidate.get("acodec") != "none"):
+                    playback = url
+                if url and candidate.get("acodec") != "none":
+                    break
+        video_key = f"instagram-{key}-video-{position}" if video.get("_type") == "playlist" else f"instagram-{key}"
+        items.append({
+            "kind": "video", "position": position, "key": video_key,
+            "thumbnail": instagram_cdn_url(entry.get("thumbnail")),
+            "playback": playback, "duration": video_duration(entry),
+        })
+    if not items:
+        raise PreviewRequestError("No downloadable items were found in this Instagram post.")
+    return {"title": video.get("title") or "Instagram post", "media_items": sorted(items, key=lambda item: item["position"])}
+
+
+def twitter_post_preview(key, *, mixed=False):
     try:
         from yt_dlp.jsinterp import js_number_to_string
     except ImportError as error:
         raise PreviewRequestError(
-            'Twitter/X photos require the yt-dlp Python package. In PowerShell, run py -m pip install -U "yt-dlp[default]".'
+            'Twitter/X previews require the yt-dlp Python package. In PowerShell, run py -m pip install -U "yt-dlp[default]".'
         ) from error
 
     # X's public embed endpoint uses a token calculated from the post ID.
@@ -1344,33 +1420,54 @@ def twitter_photo_preview(key):
 
     if not isinstance(post, dict) or not post or post.get("tombstone"):
         raise PreviewRequestError("Twitter/X did not make this post available to public previews.")
-    photos = []
+    items = []
     media_details = post.get("mediaDetails")
     if not isinstance(media_details, list):
         media_details = []
     for position, media in enumerate(media_details, 1):
-        if not isinstance(media, dict) or media.get("type") != "photo":
+        if not isinstance(media, dict):
             continue
+        kind = media.get("type")
         url = media_cdn_url("Twitter/X", media.get("media_url_https"))
-        if not url:
-            continue
-        parts = urlsplit(url)
-        if parts.hostname != "pbs.twimg.com" or not parts.path.startswith("/media/"):
-            continue
-        suffix = "" if position == 1 else f"-{position:02d}"
-        photos.append({"position": position, "url": url, "key": f"twitter-{key}{suffix}"})
-    if not photos:
+        if kind == "photo" and url:
+            parts = urlsplit(url)
+            if parts.hostname == "pbs.twimg.com" and parts.path.startswith("/media/"):
+                suffix = "" if position == 1 else f"-{position:02d}"
+                items.append({"kind": "photo", "position": position, "url": url, "key": f"twitter-{key}{suffix}"})
+        elif mixed and kind == "video":
+            info = media.get("video_info")
+            if not isinstance(info, dict):
+                info = {}
+            playback = None
+            bitrate = -1
+            for variant in info.get("variants") or []:
+                if isinstance(variant, dict) and variant.get("content_type") == "video/mp4":
+                    candidate = media_cdn_url("Twitter/X", variant.get("url"))
+                    rate = variant.get("bitrate") or 0
+                    if candidate and urlsplit(candidate).hostname == "video.twimg.com" and isinstance(rate, (int, float)) and rate > bitrate:
+                        playback, bitrate = candidate, rate
+            duration = info.get("duration_millis")
+            items.append({
+                "kind": "video", "position": position, "key": f"twitter-{key}-video-{position}",
+                "thumbnail": url, "playback": playback,
+                "duration": video_duration({"duration": duration / 1000 if isinstance(duration, (int, float)) else None}),
+            })
+    if not items:
+        if mixed:
+            raise PreviewRequestError("No downloadable items were found in this Twitter/X post.")
         raise PreviewRequestError("No photos were found in this Twitter/X post. For a video, choose MP4 video with sound.")
     user = post.get("user")
     author = user.get("screen_name") if isinstance(user, dict) else None
     title = f"Post by @{author}" if author else "Twitter/X post"
-    return {"id": key, "title": title, "photos": photos, "thumbnail": photos[0]["url"]}
+    if mixed:
+        return {"title": title, "media_items": items}
+    return {"id": key, "title": title, "photos": items, "thumbnail": items[0]["url"]}
 
 
 def lookup_preview(key, media_type, url):
     source = video_source_from(url)
     platform = source.platform if source else "YouTube"
-    cache_key = (platform, key, media_type, source.video_position if source and media_type != "image" else "")
+    cache_key = (platform, key, media_type, source.video_position if source and media_type in {"mp4", "mp3"} else "")
     with preview_cache_lock:
         # Serialize metadata lookups so simultaneous checks can share the same result.
         cached = preview_cache.get(cache_key)
@@ -1382,19 +1479,19 @@ def lookup_preview(key, media_type, url):
             raise PreviewRequestError(pause, 429)
 
         result = None
-        failure = "Could not check the size. Check the PowerShell window."
+        failure = "Could not preview the post." if media_type == "mixed" else "Could not check the size."
         try:
-            if platform == "Twitter/X" and media_type == "image":
-                preview = twitter_photo_preview(key)
+            if platform == "Twitter/X" and media_type in {"image", "mixed"}:
+                preview = twitter_post_preview(key, mixed=media_type == "mixed")
             else:
-                options = download_options(platform, media_type)
+                options = download_options(platform, "image" if media_type == "mixed" else media_type)
                 result = subprocess.run(
                     [*yt_dlp_command, *options, "--skip-download", "--dump-single-json", "--", url],
                     check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     encoding="utf-8", errors="replace", timeout=30,
                 )
                 video = json.loads(result.stdout)
-                if platform != "YouTube" and media_type != "image" and video.get("_type") == "playlist":
+                if platform != "YouTube" and media_type in {"mp4", "mp3"} and video.get("_type") == "playlist":
                     video = next((entry for entry in (video.get("entries") or []) if isinstance(entry, dict)), None)
                     if video is None:
                         raise PreviewRequestError(f"No video was found in this {platform} post.")
@@ -1402,7 +1499,9 @@ def lookup_preview(key, media_type, url):
                 preview = {"id": key, "title": video.get("title") or fallback_title, "duration": video_duration(video)}
                 if platform != "YouTube":
                     preview["thumbnail"] = media_cdn_url(platform, video.get("thumbnail"))
-                if media_type == "image":
+                if media_type == "mixed":
+                    preview = instagram_post_preview(video, key)
+                elif media_type == "image":
                     photos = instagram_photos(video, key)
                     if not photos:
                         raise PreviewRequestError("No downloadable photos were found in this Instagram post.")
@@ -1411,7 +1510,8 @@ def lookup_preview(key, media_type, url):
                     if preview["title"].startswith("Video by "):
                         preview["title"] = "Photo by " + preview["title"].removeprefix("Video by ")
         except subprocess.TimeoutExpired as error:
-            raise PreviewRequestError("The size check timed out. Try again.") from error
+            message = "The post preview timed out." if media_type == "mixed" else "The size check timed out."
+            raise PreviewRequestError(f"{message} Try again.") from error
         except subprocess.CalledProcessError as error:
             output = error.stderr or ""
             if output:
@@ -1422,21 +1522,23 @@ def lookup_preview(key, media_type, url):
                 if http_status == 429:
                     pause_platform_requests(platform)
                 raise PreviewRequestError(message, http_status) from error
-            if platform == "Instagram" and media_type != "image" and "there is no video in this post" in output.lower():
+            if platform == "Instagram" and media_type in {"mp4", "mp3"} and "there is no video in this post" in output.lower():
                 raise PreviewRequestError("Choose Photo (Instagram or X) and click Check size to see the photo.") from error
             if platform == "Twitter/X" and any(reason in output.lower() for reason in (
                 "no video could be found", "no suitable extractor", "is not a video",
             )):
                 raise PreviewRequestError("No supported video was found in this Twitter/X post. For photos, choose Photo (Instagram or X).") from error
-            raise PreviewRequestError(failure) from error
+            raise PreviewRequestError(f"{failure} Check the PowerShell window.") from error
         except (OSError, ValueError, HTTPException) as error:
-            raise PreviewRequestError(failure) from error
+            raise PreviewRequestError(f"{failure} Check the PowerShell window.") from error
 
         if result and result.stderr:
             print(result.stderr, end="", file=sys.stderr, flush=True)
         comparisons = []
         message = ""
-        if media_type == "image":
+        if media_type == "mixed":
+            sizes = {"best": ""}
+        elif media_type == "image":
             photos = preview["photos"]
             length = media_track_size(platform, photos[0], photo=True) if len(photos) == 1 else None
             sizes = {"best": size_message(format_mib(length) if length else None, False, media_type)}
@@ -1630,7 +1732,7 @@ def photo_download_events(source, download_id, cancel_url, selected_positions=No
             active_video_ids.remove(key)
 
 
-def download_events(command, url, download_id, cancel_url):
+def download_events(command, url, download_id, cancel_url, *, job=None):
     event = download_event
 
     source = video_source_from(url)
@@ -1640,12 +1742,20 @@ def download_events(command, url, download_id, cancel_url):
         yield event("error", pause, http_status=429)
         return
     key = (platform, source.key) if source else url
-    if not reserve_download(key):
-        yield event("error", "This video is already downloading.", http_status=409)
-        return
+    owns_job = job is None
+    if owns_job:
+        if not reserve_download(key):
+            yield event("error", "This video is already downloading.", http_status=409)
+            return
+        job = ActiveDownload()
+        with active_downloads_lock:
+            active_downloads[download_id] = job
     finished_video = None
     restriction = None
     try:
+        if job.cancelled:
+            yield event("cancelled", "Download cancelled.")
+            return
         downloads.mkdir(exist_ok=True)
         with subprocess.Popen(
             [
@@ -1662,11 +1772,13 @@ def download_events(command, url, download_id, cancel_url):
             encoding="utf-8", errors="replace",
             start_new_session=os.name != "nt",
         ) as process:
-            job = ActiveDownload(process)
             with active_downloads_lock:
-                active_downloads[download_id] = job
+                job.process = process
             try:
-                yield event("starting", "Starting download…", cancel_url=cancel_url)
+                if job.cancelled:
+                    stop_process_tree(process)
+                if owns_job:
+                    yield event("starting", "Starting download…", cancel_url=cancel_url)
                 for line in process.stdout:
                     if line.startswith(finished_file_prefix):
                         try:
@@ -1704,23 +1816,32 @@ def download_events(command, url, download_id, cancel_url):
                 returncode = process.wait()
             finally:
                 with active_downloads_lock:
-                    active_downloads.pop(download_id)
-                if not job.cancelled:
+                    job.process = None
+                if process.poll() is None:
                     try:
                         stop_process_tree(process)
                     except (OSError, subprocess.SubprocessError):
                         if process.poll() is None:
                             process.kill()
-        if job.cancelled:
+        if job.cancelled and (returncode != 0 or not isinstance(finished_video, dict)):
             yield event("cancelled", "Download cancelled.")
         elif returncode == 0:
+            if job.batch:
+                try:
+                    path = local_download_path(finished_video.get("filepath") or "") if isinstance(finished_video, dict) else None
+                    if path is None or not path.is_file():
+                        raise ValueError("yt-dlp did not save the selected file")
+                except (OSError, ValueError) as error:
+                    print(error, flush=True)
+                    yield event("error", download_failed)
+                    return
             try:
                 if not isinstance(finished_video, dict):
                     raise ValueError("yt-dlp did not report the final file")
                 record_download(finished_video)
             except (OSError, sqlite3.Error, ValueError) as error:
                 print(f"Could not save download history: {error}", flush=True)
-                yield event("complete", f"{download_complete} History could not be saved.")
+                yield event("complete", f"{download_complete} History could not be saved.", history_error=True)
             else:
                 yield event("complete", download_complete, history_saved=True)
         elif restriction:
@@ -1734,7 +1855,128 @@ def download_events(command, url, download_id, cancel_url):
         print(error, flush=True)
         yield event("error", download_failed)
     finally:
+        if owns_job:
+            with active_downloads_lock:
+                active_downloads.pop(download_id, None)
+                active_video_ids.remove(key)
+
+
+def mixed_item_events(source, item, title, download_id, cancel_url, job, opener):
+    if item["kind"] == "video":
+        url = source.url
+        position = item["position"]
+        if source.platform == "Twitter/X":
+            url = f"https://x.com/i/web/status/{source.key}/video/{position}"
+            position = 1
+        options = download_options(source.platform, "mp4", playlist_position=position)
+        command = [*yt_dlp_command, *options, "-o", f"%(title)s [{item['key']}].%(ext)s"]
+        yield from download_events(command, url, download_id, cancel_url, job=job)
+        return
+
+    try:
+        path = yield from save_photo(source.platform, item, opener, job, show_bytes=True)
+    except HTTPError as error:
+        error.close()
+        if error.code == 429:
+            pause_platform_requests(source.platform)
+        yield download_event("error", f"Could not save photo on slide {item['position']}.", http_status=error.code)
+        return
+    except (OSError, ValueError, HTTPException) as error:
+        print(f"Could not save photo on slide {item['position']}: {error}", flush=True)
+        yield download_event("error", f"Could not save photo on slide {item['position']}.")
+        return
+    if path is None:
+        yield download_event("cancelled", "Download cancelled.")
+        return
+    try:
+        record_download({"filepath": str(path), "title": f"{title} · Slide {item['position']}"})
+    except (OSError, sqlite3.Error, ValueError) as error:
+        print(f"Could not save download history: {error}", flush=True)
+        yield download_event("complete", download_complete, history_error=True)
+    else:
+        yield download_event("complete", download_complete, history_saved=True)
+
+
+def mixed_download_events(source, download_id, cancel_url, selected_positions):
+    pause = platform_pause_message(source.platform)
+    if pause:
+        yield download_event("error", pause, http_status=429)
+        return
+    key = (source.platform, source.key)
+    if not reserve_download(key):
+        yield download_event("error", "This post is already downloading.", http_status=409)
+        return
+
+    job = ActiveDownload(batch=True)
+    try:
         with active_downloads_lock:
+            active_downloads[download_id] = job
+        yield download_event("starting", "Starting download…", cancel_url=cancel_url)
+        preview, _, _, _ = lookup_preview(source.key, "mixed", source.url)
+        items = preview["media_items"]
+        if selected_positions is not None:
+            positions = set(selected_positions)
+            if not positions or not positions <= {str(item["position"]) for item in items}:
+                yield download_event("error", "Select at least one available item from this post.", http_status=400)
+                return
+            items = [item for item in items if str(item["position"]) in positions]
+
+        saved = 0
+        count = len(items)
+        history_error = False
+        failures = []
+        rate_limited = False
+        downloads.mkdir(exist_ok=True)
+        opener = build_opener(MediaCDNRedirect(source.platform))
+        for item in items:
+            if job.cancelled:
+                break
+            kind = item["kind"]
+            position = item["position"]
+            if find_existing_download(item["key"], "image" if kind == "photo" else "mp4"):
+                saved += 1
+                continue
+            message = f"Saving {kind} on slide {position}…"
+            yield download_event("downloading", message, item_count=count, items_saved=saved)
+            with closing(mixed_item_events(source, item, preview["title"], download_id, cancel_url, job, opener)) as events:
+                for raw in events:
+                    update = json.loads(raw)
+                    state = update["state"]
+                    if state == "complete":
+                        saved += 1
+                        history_error |= update.get("history_error", False)
+                        yield download_event(
+                            "downloading", message, item_count=count, items_saved=saved,
+                            history_saved=update.get("history_saved", False),
+                        )
+                    elif state == "error":
+                        failures.append(f"Slide {position}: {update['message']}")
+                        rate_limited = update.get("http_status") == 429
+                    elif state in {"downloading", "processing"}:
+                        yield download_event(
+                            state, message, item_count=count, items_saved=saved,
+                            downloaded=update.get("downloaded"), total=update.get("total"),
+                        )
+            if rate_limited:
+                break
+
+        summary = f"{saved} of {count} selected items ready."
+        if history_error:
+            summary += " Some download history could not be saved."
+        if job.cancelled:
+            yield download_event("cancelled", f"Download cancelled. {summary}")
+        elif failures:
+            yield download_event("error", f"{summary} {' '.join(failures)}", http_status=429 if rate_limited else 200)
+        else:
+            yield download_event("complete", f"{summary} Open your Downloads folder.", item_count=count)
+    except PreviewRequestError as error:
+        yield download_event("error", str(error), http_status=error.http_status)
+    except OSError as error:
+        print(f"Mixed post download failed: {error}", flush=True)
+        yield download_event("error", download_failed)
+    finally:
+        with active_downloads_lock:
+            active_downloads.pop(download_id, None)
             active_video_ids.remove(key)
 
 
@@ -1743,7 +1985,7 @@ def index():
     link = request.form.get("url", "").strip()
     quality = request.form.get("quality", "720")
     media_type = request.form.get("format", "mp4")
-    if media_type not in {"mp4", "mp3", "image"}:
+    if media_type not in {"mp4", "mp3", "image", "mixed"}:
         media_type = "mp4"
     action = request.form.get("action")
     downloading = action in {"download", "download-selected"}
@@ -1764,12 +2006,12 @@ def index():
         source = video_source_from(link)
         if not source:
             message = "Paste a YouTube video, Instagram post or Reel, or Twitter/X post link."
-        elif media_type == "image" and source.platform == "YouTube":
+        elif media_type in {"image", "mixed"} and source.platform == "YouTube":
             message = "Choose a video or audio format for YouTube links."
         elif media_type == "image" and source.platform == "Instagram" and not source.url.startswith("https://www.instagram.com/p/"):
             message = "Paste a public Instagram photo post link."
-        elif action == "download-selected" and media_type != "image":
-            message, http_status = "Choose Photo (Instagram or X) to select photos.", 400
+        elif action == "download-selected" and media_type not in {"image", "mixed"}:
+            message, http_status = "Choose a photo or mixed post format to select individual items.", 400
         else:
             best_only = source.platform != "YouTube"
             if best_only:
@@ -1779,7 +2021,7 @@ def index():
             if best_only:
                 prefix = "instagram" if source.platform == "Instagram" else "twitter"
                 history_key = f"{prefix}-{source.key}"
-                if source.video_position and media_type != "image":
+                if source.video_position and media_type in {"mp4", "mp3"}:
                     history_key += f"-video-{source.video_position}"
                 options += ["-o", f"%(title)s [{history_key}].%(ext)s"]
             command = [*yt_dlp_command, *options]
@@ -1790,6 +2032,9 @@ def index():
                 if media_type == "image":
                     positions = request.form.getlist("photo_position") if action == "download-selected" else None
                     events = photo_download_events(source, download_id, cancel_url, positions)
+                elif media_type == "mixed":
+                    positions = request.form.getlist("media_position") if action == "download-selected" else None
+                    events = mixed_download_events(source, download_id, cancel_url, positions)
                 else:
                     events = download_events(command, source.url, download_id, cancel_url)
                 if streaming:
@@ -1804,8 +2049,9 @@ def index():
             else:
                 if streaming:
                     return {"message": "Check the size for these settings before downloading."}, 400
-                existing = find_existing_download(history_key, media_type)
-                if media_type == "image" or not existing or action == "check-online":
+                if media_type != "mixed":
+                    existing = find_existing_download(history_key, media_type)
+                if media_type in {"image", "mixed"} or not existing or action == "check-online":
                     try:
                         preview, sizes, comparisons, message = lookup_preview(source.key, media_type, source.url)
                     except PreviewRequestError as error:
