@@ -314,6 +314,11 @@ page = r"""
   }
   .form-options .primary { min-height: 3rem; padding-inline: 1.4rem; }
   #url { min-height: 3.25rem; }
+  .url-controls { display: flex; align-items: stretch; gap: 0.5rem; }
+  .url-controls input { min-width: 0; }
+  #paste-link { flex-shrink: 0; }
+  #paste-status { margin: 0.4rem 0 0; color: var(--muted); font-size: 0.875rem; }
+  #paste-status:empty { margin: 0; }
   #download-status { margin: 1rem 0 0; padding: 0.75rem 1rem; border-radius: 0.625rem; background: var(--wash); }
   #download-status:empty, #existing-status:empty { margin: 0; padding: 0; }
   progress { width: min(100%, 30rem); height: 1.25rem; }
@@ -384,7 +389,11 @@ page = r"""
 <form id="download-form" method="post" action="{{ url_for('index') }}">
   <div class="field">
     <label for="url">YouTube, Instagram, or Twitter/X link</label>
-    <input id="url" name="url" type="url" value="{{ link }}" placeholder="https://…" required>
+    <div class="url-controls">
+      <input id="url" name="url" type="url" value="{{ link }}" placeholder="https://…" required>
+      <button id="paste-link" type="button" hidden>Paste link</button>
+    </div>
+    <p id="paste-status" role="status"></p>
   </div>
   <div class="form-options">
     <div class="field">
@@ -529,6 +538,9 @@ page = r"""
 </template>
 <script>
   const form = document.querySelector('#download-form');
+  const urlField = form.elements.url;
+  const pasteLink = document.querySelector('#paste-link');
+  const pasteStatus = document.querySelector('#paste-status');
   const checkStatus = document.querySelector('#download-status');
   const checkedResult = document.querySelector('#checked-result');
   const photoDialog = document.querySelector('#photo-preview-dialog');
@@ -547,6 +559,43 @@ page = r"""
   {% include 'open-saved-download.js' %}
   existingResult.addEventListener('submit', event => {
     openSavedDownload(event, document.querySelector('#existing-status'));
+  });
+
+  pasteLink.hidden = false;
+  pasteLink.addEventListener('click', async () => {
+    const previousValue = urlField.value;
+    pasteStatus.textContent = '';
+    pasteLink.disabled = true;
+    let copiedText;
+    try {
+      copiedText = (await navigator.clipboard.readText()).trim();
+    } catch {
+      pasteStatus.textContent = 'Clipboard unavailable. Press Ctrl+V in the link box to paste.';
+      urlField.focus();
+      return;
+    } finally {
+      pasteLink.disabled = false;
+    }
+    if (urlField.value !== previousValue) return;
+    urlField.focus();
+    if (!copiedText) {
+      pasteStatus.textContent = 'Your clipboard is empty. Copy a link first.';
+      return;
+    }
+    try {
+      if (new URL(copiedText).protocol !== 'https:') {
+        pasteStatus.textContent = 'Copy an HTTPS link and try again.';
+        return;
+      }
+    } catch {
+      pasteStatus.textContent = 'Copy a link and try again.';
+      return;
+    }
+    if (copiedText !== previousValue) {
+      urlField.value = copiedText;
+      urlField.dispatchEvent(new Event('input', {bubbles: true}));
+    }
+    pasteStatus.textContent = 'Link pasted.';
   });
 
   function updatePhotoSelection() {
@@ -594,6 +643,7 @@ page = r"""
 
   updatePhotoSelection();
   form.addEventListener('input', event => {
+    if (event.target === urlField) pasteStatus.textContent = '';
     if (event.target.name === 'photo_position') {
       updatePhotoSelection();
       return;
